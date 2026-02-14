@@ -13,7 +13,6 @@ use super::{
     TextHorizontalAlignment, TextOverflow, TextStrokeStyle, TextVerticalAlignment, TextWrap,
     VoidArg, WindowItem,
 };
-use crate::api;
 use crate::graphics::{Brush, Color, FontRequest};
 use crate::input::{
     FocusEvent, FocusEventResult, FocusReason, InputEventFilterResult, InputEventResult, KeyEvent,
@@ -87,6 +86,7 @@ impl Item for ComplexText {
         _: &MouseEvent,
         _window_adapter: &Rc<dyn WindowAdapter>,
         _self_rc: &ItemRc,
+        _: &mut super::MouseCursor,
     ) -> InputEventFilterResult {
         InputEventFilterResult::ForwardAndIgnore
     }
@@ -96,6 +96,7 @@ impl Item for ComplexText {
         _: &MouseEvent,
         _window_adapter: &Rc<dyn WindowAdapter>,
         _self_rc: &ItemRc,
+        _: &mut super::MouseCursor,
     ) -> InputEventResult {
         InputEventResult::EventIgnored
     }
@@ -231,7 +232,7 @@ impl ComplexText {
 pub struct StyledTextItem {
     pub width: Property<LogicalLength>,
     pub height: Property<LogicalLength>,
-    pub text: Property<api::StyledText>,
+    pub text: Property<crate::styled_text::StyledText>,
     pub font_size: Property<LogicalLength>,
     pub font_weight: Property<i32>,
     pub color: Property<Brush>,
@@ -274,6 +275,7 @@ impl Item for StyledTextItem {
         _: &MouseEvent,
         _window_adapter: &Rc<dyn WindowAdapter>,
         _self_rc: &ItemRc,
+        _: &mut super::MouseCursor,
     ) -> InputEventFilterResult {
         InputEventFilterResult::ForwardEvent
     }
@@ -284,6 +286,7 @@ impl Item for StyledTextItem {
         event: &MouseEvent,
         window_adapter: &Rc<dyn WindowAdapter>,
         self_rc: &ItemRc,
+        _: &mut super::MouseCursor,
     ) -> InputEventResult {
         match event {
             MouseEvent::Pressed {
@@ -316,6 +319,7 @@ impl Item for StyledTextItem {
         _: &MouseEvent,
         _window_adapter: &Rc<dyn WindowAdapter>,
         _self_rc: &ItemRc,
+        _: &mut super::MouseCursor,
     ) -> InputEventResult {
         InputEventResult::EventIgnored
     }
@@ -484,6 +488,7 @@ impl Item for SimpleText {
         _: &MouseEvent,
         _window_adapter: &Rc<dyn WindowAdapter>,
         _self_rc: &ItemRc,
+        _: &mut super::MouseCursor,
     ) -> InputEventFilterResult {
         InputEventFilterResult::ForwardAndIgnore
     }
@@ -493,6 +498,7 @@ impl Item for SimpleText {
         _: &MouseEvent,
         _window_adapter: &Rc<dyn WindowAdapter>,
         _self_rc: &ItemRc,
+        _: &mut super::MouseCursor,
     ) -> InputEventResult {
         InputEventResult::EventIgnored
     }
@@ -801,6 +807,7 @@ impl Item for TextInput {
         _: &MouseEvent,
         _window_adapter: &Rc<dyn WindowAdapter>,
         _self_rc: &ItemRc,
+        _: &mut super::MouseCursor,
     ) -> InputEventFilterResult {
         InputEventFilterResult::ForwardEvent
     }
@@ -810,10 +817,14 @@ impl Item for TextInput {
         event: &MouseEvent,
         window_adapter: &Rc<dyn WindowAdapter>,
         self_rc: &ItemRc,
+        cursor: &mut super::MouseCursor,
     ) -> InputEventResult {
         if !self.enabled() {
             return InputEventResult::EventIgnored;
         }
+
+        *cursor = super::MouseCursor::Text;
+
         match event {
             MouseEvent::Pressed {
                 position, button: PointerEventButton::Left, click_count, ..
@@ -868,16 +879,8 @@ impl Item for TextInput {
                 );
                 self.paste_clipboard(window_adapter, self_rc, Clipboard::SelectionClipboard);
             }
-            MouseEvent::Exit => {
-                if let Some(x) = window_adapter.internal(crate::InternalToken) {
-                    x.set_mouse_cursor(super::MouseCursor::Default);
-                }
-                self.as_ref().pressed.set(0)
-            }
+            MouseEvent::Exit => self.as_ref().pressed.set(0),
             MouseEvent::Moved { position, .. } => {
-                if let Some(x) = window_adapter.internal(crate::InternalToken) {
-                    x.set_mouse_cursor(super::MouseCursor::Text);
-                }
                 let pressed = self.as_ref().pressed.get();
                 if pressed > 0 {
                     let clicked_offset =
@@ -1918,7 +1921,7 @@ impl TextInput {
         let text = self.text();
 
         WindowInner::from_pub(window_adapter.window())
-            .ctx
+            .context()
             .platform()
             .set_clipboard_text(&text[anchor..cursor], clipboard);
     }
@@ -1933,8 +1936,10 @@ impl TextInput {
         self_rc: &ItemRc,
         clipboard: Clipboard,
     ) {
-        if let Some(text) =
-            WindowInner::from_pub(window_adapter.window()).ctx.platform().clipboard_text(clipboard)
+        if let Some(text) = WindowInner::from_pub(window_adapter.window())
+            .context()
+            .platform()
+            .clipboard_text(clipboard)
         {
             self.preedit_text.set(Default::default());
             self.insert(&text, window_adapter, self_rc);

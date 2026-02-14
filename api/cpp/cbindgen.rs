@@ -87,14 +87,14 @@ namespace slint::platform::key_codes {{
 "#
     )?;
     macro_rules! print_key_codes {
-        ($($char:literal # $name:ident # $($qt:ident)|* # $($winit:ident $(($_pos:ident))?)|* # $($_xkb:ident)|*;)*) => {
+        ($($char:literal # $name:ident # $($shifted:expr)? $(=> $($qt:ident)|* # $($winit:ident $(($_pos:ident))?)|* # $($_xkb:ident)|*)? ;)*) => {
             $(
                 writeln!(enums_pub, "/// A constant that represents the key code to be used in slint::Window::dispatch_key_press_event()")?;
                 writeln!(enums_pub, r#"constexpr std::u8string_view {} = u8"\u{:04x}";"#, stringify!($name), $char as u32)?;
             )*
         };
     }
-    i_slint_common::for_each_special_keys!(print_key_codes);
+    i_slint_common::for_each_keys!(print_key_codes);
     writeln!(enums_pub, "}}")?;
 
     enums_priv.flush()?;
@@ -246,8 +246,8 @@ fn default_config() -> cbindgen::Config {
         ("target_arch = wasm32".into(), "SLINT_TARGET_WASM".into()),
         ("target_os = android".into(), "__ANDROID__".into()),
         // Disable Rust WGPU specific API feature
-        ("feature = unstable-wgpu-26".into(), "SLINT_DISABLED_CODE".into()),
         ("feature = unstable-wgpu-27".into(), "SLINT_DISABLED_CODE".into()),
+        ("feature = unstable-wgpu-28".into(), "SLINT_DISABLED_CODE".into()),
     ]
     .iter()
     .cloned()
@@ -302,6 +302,7 @@ fn gen_corelib(
         "SwipeGestureHandler",
         "Flickable",
         "SimpleText",
+        "StyledTextItem",
         "ComplexText",
         "Path",
         "WindowItem",
@@ -422,7 +423,7 @@ fn gen_corelib(
         .with_src(crate_dir.join("string.rs"))
         .with_src(crate_dir.join("styled_text.rs"))
         .with_src(crate_dir.join("slice.rs"))
-        .with_after_include("namespace slint { struct SharedString; struct StyledText; }")
+        .with_after_include("namespace slint { struct SharedString; namespace private_api { struct StyledText; } namespace cbindgen_private { using private_api::StyledText; }}")
         .generate()
         .context("Unable to generate bindings for slint_string_internal.h")?
         .write_to_file(include_dir.join("slint_string_internal.h"));
@@ -508,7 +509,9 @@ fn gen_corelib(
             "slint_color_mix",
             "slint_color_with_alpha",
             "slint_color_to_hsva",
-            "slint_color_from_hsva",],
+            "slint_color_from_hsva",
+            "slint_color_from_oklch",
+            "slint_color_to_oklch",],
             "slint_color_internal.h",
             "",
         ),
@@ -524,7 +527,7 @@ fn gen_corelib(
             "",
         ),
         (
-            vec!["MouseEvent"],
+            vec!["MouseEvent", "KeyboardShortcut"],
             "slint_events_internal.h",
             "#include \"slint_point.h\"
             namespace slint::cbindgen_private {
@@ -541,6 +544,9 @@ fn gen_corelib(
         let mut special_config = config.clone();
         special_config.export.include = rust_types.iter().map(|s| s.to_string()).collect();
         special_config.export.exclude = [
+            "slint_keyboard_shortcut_to_string",
+            "slint_keyboard_shortcut_matches",
+            "slint_keyboard_shortcut",
             "slint_visit_item_tree",
             "slint_windowrc_drop",
             "slint_windowrc_clone",
@@ -757,6 +763,7 @@ namespace slint {
         using types::IntRect;
         using types::Size;
         using types::MouseEvent;
+        using types::KeyboardShortcut;
     }
     template<typename ModelData> class Model;
 }",

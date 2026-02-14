@@ -67,12 +67,10 @@ pub static COLLECTION: std::sync::LazyLock<Collection> = std::sync::LazyLock::ne
         let path = std::path::Path::new(&path);
         if path.extension().is_some() {
             add_font_from_path(path.to_owned());
-        } else {
-            if let Ok(dir) = std::fs::read_dir(path) {
-                for file in dir {
-                    if let Ok(file) = file {
-                        add_font_from_path(file.path());
-                    }
+        } else if let Ok(dir) = std::fs::read_dir(path) {
+            for file in dir {
+                if let Ok(file) = file {
+                    add_font_from_path(file.path());
                 }
             }
         }
@@ -179,6 +177,7 @@ pub const FALLBACK_FAMILIES: [fontique::GenericFamily; 2] = [
 /// to map the blob to the native type face representation (skia_safe::Typeface, femtovg::FontId, QRawFont, etc.).
 /// The use as key also ensures the blob remains strongly referenced, so that it doesn't vanish from the
 /// shared SourceCache (parley prunes it).
+#[derive(Clone)]
 pub struct HashedBlob(fontique::Blob<u8>);
 impl core::hash::Hash for HashedBlob {
     fn hash<H: core::hash::Hasher>(&self, state: &mut H) {

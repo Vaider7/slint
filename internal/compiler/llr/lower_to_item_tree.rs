@@ -264,6 +264,13 @@ fn lower_sub_component(
         layout_info_v: super::Expression::BoolLiteral(false).into(),
         child_of_layout: component.root_element.borrow().child_of_layout,
         grid_layout_input_for_repeated: None,
+        is_repeated_row: component
+            .root_element
+            .borrow()
+            .grid_layout_cell
+            .as_ref()
+            .is_some_and(|c| c.borrow().child_items.is_some()),
+        grid_layout_children: Default::default(),
         accessible_prop: Default::default(),
         element_infos: Default::default(),
         prop_analysis: Default::default(),
@@ -554,13 +561,33 @@ fn lower_sub_component(
     )
     .into();
     if let Some(grid_layout_cell) = component.root_element.borrow().grid_layout_cell.as_ref() {
+        let grid_cell_ref = grid_layout_cell.borrow();
         sub_component.grid_layout_input_for_repeated = Some(
-            super::lower_expression::get_grid_layout_input_for_repeated(
-                &mut ctx,
-                &grid_layout_cell.borrow(),
-            )
-            .into(),
+            super::lower_expression::get_grid_layout_input_for_repeated(&mut ctx, &grid_cell_ref)
+                .into(),
         );
+
+        // Store constraints for children of the Row
+        if let Some(children_constraints) = grid_cell_ref.child_items.as_ref() {
+            for layout_item in children_constraints.iter() {
+                let layout_info_h = super::lower_expression::get_layout_info(
+                    &layout_item.element,
+                    &mut ctx,
+                    &layout_item.constraints,
+                    crate::layout::Orientation::Horizontal,
+                );
+                let layout_info_v = super::lower_expression::get_layout_info(
+                    &layout_item.element,
+                    &mut ctx,
+                    &layout_item.constraints,
+                    crate::layout::Orientation::Vertical,
+                );
+                sub_component.grid_layout_children.push(super::GridLayoutChildLayoutInfo {
+                    layout_info_h: layout_info_h.into(),
+                    layout_info_v: layout_info_v.into(),
+                });
+            }
+        }
     }
 
     sub_component.accessible_prop = accessible_prop

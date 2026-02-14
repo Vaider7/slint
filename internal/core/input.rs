@@ -7,9 +7,8 @@
 
 use crate::item_tree::ItemTreeRc;
 use crate::item_tree::{ItemRc, ItemWeak, VisitChildrenResult};
-pub use crate::items::PointerEventButton;
-use crate::items::{DropEvent, ItemRef, TextCursorDirection};
-pub use crate::items::{FocusReason, KeyEvent, KeyboardModifiers};
+use crate::items::{DropEvent, ItemRef, MouseCursor, TextCursorDirection};
+pub use crate::items::{FocusReason, KeyEvent, KeyboardModifiers, PointerEventButton};
 use crate::lengths::{ItemTransform, LogicalPoint, LogicalVector};
 use crate::timers::Timer;
 use crate::window::{WindowAdapter, WindowInner};
@@ -18,6 +17,7 @@ use alloc::rc::Rc;
 use alloc::vec::Vec;
 use const_field_offset::FieldOffsets;
 use core::cell::Cell;
+use core::fmt::Display;
 use core::pin::Pin;
 use core::time::Duration;
 
@@ -187,7 +187,7 @@ pub enum InputEventFilterResult {
 #[allow(missing_docs, non_upper_case_globals)]
 pub mod key_codes {
     macro_rules! declare_consts_for_special_keys {
-       ($($char:literal # $name:ident # $($_qt:ident)|* # $($_winit:ident $(($_pos:ident))?)|*    # $($_xkb:ident)|*;)*) => {
+       ($($char:literal # $name:ident # $($shifted:expr)? $(=> $($_qt:ident)|* # $($_winit:ident $(($_pos:ident))?)|*    # $($_xkb:ident)|* )? ;)*) => {
             $(pub const $name : char = $char;)*
 
             #[allow(missing_docs)]
@@ -227,7 +227,7 @@ pub mod key_codes {
         };
     }
 
-    i_slint_common::for_each_special_keys!(declare_consts_for_special_keys);
+    i_slint_common::for_each_keys!(declare_consts_for_special_keys);
 }
 
 /// Internal struct to maintain the pressed/released state of the keys that
@@ -312,6 +312,139 @@ impl From<InternalKeyboardModifierState> for KeyboardModifiers {
     }
 }
 
+/// A `KeyboardShortcut` is created by the `@keys(...)` macro and
+/// defines which key events match the given shortcuts.
+///
+/// See [`Self::matches()`] for details
+#[derive(Clone, Eq, PartialEq, Default)]
+#[repr(C)]
+pub struct KeyboardShortcut {
+    /// The `key` used to trigger the shortcut
+    ///
+    /// Note: This is currently converted to lowercase when the shortcut is created!
+    key: SharedString,
+    /// `KeyboardModifier`s that need to be pressed for the shortcut to fire
+    modifiers: KeyboardModifiers,
+    /// Whether to ignore shift state when matching the shortcut
+    ignore_shift: bool,
+    /// Whether to ignore alt state when matching the shortcut
+    ignore_alt: bool,
+}
+
+/// Re-exported in private_unstable_api to create a KeyboardShortcut struct.
+pub fn make_keyboard_shortcut(
+    key: SharedString,
+    modifiers: KeyboardModifiers,
+    ignore_shift: bool,
+    ignore_alt: bool,
+) -> KeyboardShortcut {
+    KeyboardShortcut { key: key.to_lowercase().into(), modifiers, ignore_shift, ignore_alt }
+}
+
+#[cfg(feature = "ffi")]
+#[allow(unsafe_code)]
+pub(crate) mod ffi {
+    use super::*;
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn slint_keyboard_shortcut(
+        key: &SharedString,
+        alt: bool,
+        control: bool,
+        shift: bool,
+        meta: bool,
+        ignore_shift: bool,
+        ignore_alt: bool,
+        out: &mut KeyboardShortcut,
+    ) {
+        *out = make_keyboard_shortcut(
+            key.clone(),
+            KeyboardModifiers { alt, control, shift, meta },
+            ignore_shift,
+            ignore_alt,
+        );
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn slint_keyboard_shortcut_to_string(
+        shortcut: &KeyboardShortcut,
+        out: &mut SharedString,
+    ) {
+        *out = crate::format!("{shortcut}")
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn slint_keyboard_shortcut_matches(
+        shortcut: &KeyboardShortcut,
+        key_event: &KeyEvent,
+    ) -> bool {
+        shortcut.matches(key_event)
+    }
+}
+
+impl KeyboardShortcut {
+    /// Check whether a `KeyboardShortcut` can be triggered by the given `KeyEvent`
+    pub fn matches(&self, key_event: &KeyEvent) -> bool {
+        // An empty KeyboardShortcut is never triggered, even if the modifiers match.
+        if self.key.is_empty() {
+            return false;
+        }
+
+        // TODO: Should this check the event_type and only match on KeyReleased?
+        let mut expected_modifiers = self.modifiers.clone();
+        if self.ignore_shift {
+            expected_modifiers.shift = key_event.modifiers.shift;
+        }
+        if self.ignore_alt {
+            expected_modifiers.alt = key_event.modifiers.alt;
+        }
+        // Note: The constructor of KeyboardShortcut ensures that the shortcut's key is already
+        // in lowercase, so we can just compare it to the lowercased event text.
+        //
+        // This improves our handling of CapsLock and Shift, as the event text will be in uppercase
+        // if caps lock is active, even if shift is not pressed.
+        let event_text = key_event.text.chars().flat_map(|character| character.to_lowercase());
+
+        event_text.eq(self.key.chars()) && key_event.modifiers == expected_modifiers
+    }
+}
+
+impl Display for KeyboardShortcut {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // Make sure to keep this in sync with the implemenation in compiler/langtype.rs
+        if self.key.is_empty() {
+            write!(f, "")
+        } else {
+            let alt = self
+                .ignore_alt
+                .then_some("IgnoreAlt+")
+                .or(self.modifiers.alt.then_some("Alt+"))
+                .unwrap_or_default();
+            let ctrl = if self.modifiers.control { "Control+" } else { "" };
+            let meta = if self.modifiers.meta { "Meta+" } else { "" };
+            let shift = self
+                .ignore_shift
+                .then_some("IgnoreShift+")
+                .or(self.modifiers.shift.then_some("Shift+"))
+                .unwrap_or_default();
+            let keycode: SharedString = self
+                .key
+                .chars()
+                .flat_map(|character| {
+                    let mut escaped = alloc::vec![];
+                    if character.is_control() {
+                        escaped.extend(character.escape_unicode());
+                    } else {
+                        escaped.push(character);
+                    }
+                    escaped
+                })
+                .collect();
+            write!(f, "{meta}{ctrl}{alt}{shift}\"{keycode}\"")
+        }
+    }
+}
+
 /// This enum defines the different kinds of key events that can happen.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 #[repr(u8)]
@@ -353,7 +486,7 @@ impl KeyEvent {
         } else if self.modifiers.control && self.modifiers.shift {
             match self.text.as_str() {
                 #[cfg(not(target_os = "windows"))]
-                "z" => Some(StandardShortcut::Redo),
+                "z" | "Z" => Some(StandardShortcut::Redo),
                 _ => None,
             }
         } else {
@@ -602,6 +735,7 @@ pub struct MouseInputState {
     pub(crate) drag_data: Option<DropEvent>,
     delayed: Option<(crate::timers::Timer, MouseEvent)>,
     delayed_exit_items: Vec<ItemWeak>,
+    pub(crate) cursor: MouseCursor,
 }
 
 impl MouseInputState {
@@ -644,7 +778,12 @@ pub(crate) fn handle_mouse_grab(
             return false;
         };
         if intercept {
-            item.borrow().as_ref().input_event(&MouseEvent::Exit, window_adapter, &item);
+            item.borrow().as_ref().input_event(
+                &MouseEvent::Exit,
+                window_adapter,
+                &item,
+                &mut mouse_input_state.cursor,
+            );
             return false;
         }
         let g = item.geometry();
@@ -666,6 +805,7 @@ pub(crate) fn handle_mouse_grab(
                 &event,
                 window_adapter,
                 &item,
+                &mut mouse_input_state.cursor,
             ) == InputEventFilterResult::Intercept
         {
             intercept = true;
@@ -677,7 +817,12 @@ pub(crate) fn handle_mouse_grab(
     }
 
     let grabber = mouse_input_state.top_item().unwrap();
-    let input_result = grabber.borrow().as_ref().input_event(&event, window_adapter, &grabber);
+    let input_result = grabber.borrow().as_ref().input_event(
+        &event,
+        window_adapter,
+        &grabber,
+        &mut mouse_input_state.cursor,
+    );
     match input_result {
         InputEventResult::GrabMouse => None,
         InputEventResult::StartDrag => {
@@ -707,9 +852,12 @@ pub(crate) fn send_exit_events(
     mut pos: Option<LogicalPoint>,
     window_adapter: &Rc<dyn WindowAdapter>,
 ) {
+    // Note that exit events can't actually change the cursor from default so we'll ignore the result
+    let cursor = &mut MouseCursor::Default;
+
     for it in core::mem::take(&mut new_input_state.delayed_exit_items) {
         let Some(item) = it.upgrade() else { continue };
-        item.borrow().as_ref().input_event(&MouseEvent::Exit, window_adapter, &item);
+        item.borrow().as_ref().input_event(&MouseEvent::Exit, window_adapter, &item, cursor);
     }
 
     let mut clipped = false;
@@ -729,13 +877,18 @@ pub(crate) fn send_exit_events(
             if item.borrow().as_ref().clips_children() {
                 clipped = true;
             }
-            item.borrow().as_ref().input_event(&MouseEvent::Exit, window_adapter, &item);
+            item.borrow().as_ref().input_event(&MouseEvent::Exit, window_adapter, &item, cursor);
         } else if new_input_state.item_stack.get(idx).is_none_or(|(x, _)| *x != it.0) {
             // The item is still under the mouse, but no longer in the item stack. We should also sent the exit event, unless we delay it
             if new_input_state.delayed.is_some() {
                 new_input_state.delayed_exit_items.push(it.0.clone());
             } else {
-                item.borrow().as_ref().input_event(&MouseEvent::Exit, window_adapter, &item);
+                item.borrow().as_ref().input_event(
+                    &MouseEvent::Exit,
+                    window_adapter,
+                    &item,
+                    cursor,
+                );
             }
         }
     }
@@ -750,8 +903,11 @@ pub fn process_mouse_input(
     window_adapter: &Rc<dyn WindowAdapter>,
     mouse_input_state: MouseInputState,
 ) -> MouseInputState {
-    let mut result =
-        MouseInputState { drag_data: mouse_input_state.drag_data.clone(), ..Default::default() };
+    let mut result = MouseInputState {
+        drag_data: mouse_input_state.drag_data.clone(),
+        cursor: mouse_input_state.cursor,
+        ..Default::default()
+    };
     let r = send_mouse_event_to_item(
         mouse_event,
         root.clone(),
@@ -848,6 +1004,7 @@ fn send_mouse_event_to_item(
             &event_for_children,
             window_adapter,
             &item_rc,
+            &mut result.cursor,
         )
     } else {
         InputEventFilterResult::ForwardAndIgnore
@@ -911,7 +1068,7 @@ fn send_mouse_event_to_item(
         if last_top_item.is_none_or(|x| *x != item_rc) {
             event.set_click_count(0);
         }
-        item.as_ref().input_event(&event, window_adapter, &item_rc)
+        item.as_ref().input_event(&event, window_adapter, &item_rc, &mut result.cursor)
     };
     match r {
         InputEventResult::EventAccepted => VisitChildrenResult::abort(item_rc.index(), 0),

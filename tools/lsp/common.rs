@@ -539,6 +539,7 @@ pub struct PreviewConfig {
     pub include_paths: Vec<PathBuf>,
     pub library_paths: HashMap<String, PathBuf>,
     pub format_utf8: bool,
+    pub enable_experimental: bool,
 }
 
 /// The Component to preview
@@ -561,6 +562,7 @@ pub enum LspToPreviewMessage {
     SetConfiguration { config: PreviewConfig },
     ShowPreview(PreviewComponent),
     HighlightFromEditor { url: Option<Url>, offset: u32 },
+    Quit,
 }
 
 impl lsp_types::notification::Notification for LspToPreviewMessage {

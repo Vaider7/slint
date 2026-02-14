@@ -15,7 +15,7 @@ use crate::input::{
     MouseEvent, MouseInputState, PointerEventButton, TextCursorBlinker, key_codes,
 };
 use crate::item_tree::{
-    ItemRc, ItemTreeRc, ItemTreeRef, ItemTreeVTable, ItemTreeWeak, ItemWeak,
+    ItemRc, ItemTreeRc, ItemTreeRef, ItemTreeRefPin, ItemTreeVTable, ItemTreeWeak, ItemWeak,
     ParentItemTraversalMode,
 };
 use crate::items::{ColorScheme, InputType, ItemRef, MouseCursor, PopupClosePolicy};
@@ -165,7 +165,7 @@ pub trait WindowAdapter {
 #[doc(hidden)]
 pub trait WindowAdapterInternal: core::any::Any {
     /// This function is called by the generated code when a component and therefore its tree of items are created.
-    fn register_item_tree(&self) {}
+    fn register_item_tree(&self, _: ItemTreeRefPin) {}
 
     /// This function is called by the generated code when a component and therefore its tree of items are destroyed. The
     /// implementation typically uses this to free the underlying graphics resources.
@@ -246,7 +246,7 @@ pub trait WindowAdapterInternal: core::any::Any {
 
     /// Return the inset of the safe area of the Window in physical pixels.
     /// This is necessary to avoid overlapping system UI such as notches or system bars.
-    fn safe_area_inset(&self) -> crate::lengths::PhysicalInset {
+    fn safe_area_inset(&self) -> crate::lengths::PhysicalEdges {
         Default::default()
     }
 }
@@ -468,7 +468,7 @@ pub struct WindowInner {
     had_popup_on_press: Cell<bool>,
     close_requested: Callback<(), CloseRequestResponse>,
     click_state: ClickState,
-    pub(crate) ctx: once_cell::unsync::Lazy<crate::SlintContext>,
+    ctx: core::cell::OnceCell<crate::SlintContext>,
 }
 
 impl Drop for WindowInner {
@@ -527,11 +527,7 @@ impl WindowInner {
             close_requested: Default::default(),
             click_state: ClickState::default(),
             prevent_focus_change: Default::default(),
-            // The ctx is lazy so that a Window can be initialized before the backend.
-            // (for example in test_empty_window)
-            ctx: once_cell::unsync::Lazy::new(|| {
-                crate::context::GLOBAL_CONTEXT.with(|ctx| ctx.get().unwrap().clone())
-            }),
+            ctx: Default::default(),
         }
     }
 
@@ -552,12 +548,7 @@ impl WindowInner {
             .internal(crate::InternalToken)
             .map(|internal| internal.safe_area_inset())
             .unwrap_or_default();
-        self.set_window_item_safe_area(
-            inset.top_to_logical(scale_factor),
-            inset.bottom_to_logical(scale_factor),
-            inset.left_to_logical(scale_factor),
-            inset.right_to_logical(scale_factor),
-        );
+        self.set_window_item_safe_area(inset.to_logical(scale_factor));
         window_adapter.request_redraw();
         let weak = Rc::downgrade(&window_adapter);
         crate::timers::Timer::single_shot(Default::default(), move || {
@@ -588,26 +579,26 @@ impl WindowInner {
     pub fn process_mouse_input(&self, mut event: MouseEvent) {
         crate::animations::update_animations();
 
+        let Some(item_tree) = self.try_component() else { return };
+
         // handle multiple press release
-        event = self.click_state.check_repeat(event, self.ctx.platform().click_interval());
+        event = self.click_state.check_repeat(event, self.context().platform().click_interval());
 
         let window_adapter = self.window_adapter();
         let mut mouse_input_state = self.mouse_input_state.take();
+
+        let old_cursor = core::mem::replace(&mut mouse_input_state.cursor, MouseCursor::Default);
+
         if let Some(mut drop_event) = mouse_input_state.drag_data.clone() {
             match &event {
                 MouseEvent::Released { position, button: PointerEventButton::Left, .. } => {
-                    if let Some(window_adapter) = window_adapter.internal(crate::InternalToken) {
-                        window_adapter.set_mouse_cursor(MouseCursor::Default);
-                    }
                     drop_event.position = crate::lengths::logical_position_to_api(*position);
                     event = MouseEvent::Drop(drop_event);
                     mouse_input_state.drag_data = None;
                 }
                 MouseEvent::Moved { position, .. } => {
-                    if let Some(window_adapter) = window_adapter.internal(crate::InternalToken) {
-                        window_adapter.set_mouse_cursor(MouseCursor::NoDrop);
-                    }
                     drop_event.position = crate::lengths::logical_position_to_api(*position);
+                    mouse_input_state.cursor = MouseCursor::NoDrop;
                     event = MouseEvent::DragMove(drop_event);
                 }
                 MouseEvent::Exit => {
@@ -625,8 +616,6 @@ impl WindowInner {
             mouse_input_state =
                 crate::input::process_delayed_event(&window_adapter, mouse_input_state);
         }
-
-        let Some(item_tree) = self.try_component() else { return };
 
         // Try to get the root window in case `self` is the popup itself (to get the active_popups list)
         let mut root_adapter = None;
@@ -749,7 +738,13 @@ impl WindowInner {
 
         if last_top_item != mouse_input_state.top_item_including_delayed() {
             self.click_state.reset();
-            self.click_state.check_repeat(event, self.ctx.platform().click_interval());
+            self.click_state.check_repeat(event, self.context().platform().click_interval());
+        }
+
+        if old_cursor != mouse_input_state.cursor
+            && let Some(window_adapter) = window_adapter.internal(crate::InternalToken)
+        {
+            window_adapter.set_mouse_cursor(mouse_input_state.cursor);
         }
 
         self.mouse_input_state.set(mouse_input_state);
@@ -890,7 +885,11 @@ impl WindowInner {
             new_blinker
         });
 
-        TextCursorBlinker::set_binding(blinker, prop, self.ctx.platform().cursor_flash_cycle());
+        TextCursorBlinker::set_binding(
+            blinker,
+            prop,
+            self.context().platform().cursor_flash_cycle(),
+        );
     }
 
     /// Sets the focus to the item pointed to by item_ptr. This will remove the focus from any
@@ -1140,7 +1139,7 @@ impl WindowInner {
         if let Some(component) = self.try_component() {
             let was_visible = self.strong_component_ref.replace(Some(component)).is_some();
             if !was_visible {
-                *(self.ctx.0.window_count.borrow_mut()) += 1;
+                *(self.context().0.window_count.borrow_mut()) += 1;
             }
         }
 
@@ -1156,14 +1155,9 @@ impl WindowInner {
             .internal(crate::InternalToken)
             .map(|internal| internal.safe_area_inset())
             .unwrap_or_default();
-        self.set_window_item_safe_area(
-            inset.top_to_logical(scale_factor),
-            inset.bottom_to_logical(scale_factor),
-            inset.left_to_logical(scale_factor),
-            inset.right_to_logical(scale_factor),
-        );
+        self.set_window_item_safe_area(inset.to_logical(scale_factor));
         self.window_adapter().renderer().resize(size).unwrap();
-        if let Some(hook) = self.ctx.0.window_shown_hook.borrow_mut().as_mut() {
+        if let Some(hook) = self.context().0.window_shown_hook.borrow_mut().as_mut() {
             hook(&self.window_adapter());
         }
         Ok(())
@@ -1174,11 +1168,11 @@ impl WindowInner {
         let result = self.window_adapter().set_visible(false);
         let was_visible = self.strong_component_ref.borrow_mut().take().is_some();
         if was_visible {
-            let mut count = self.ctx.0.window_count.borrow_mut();
+            let mut count = self.context().0.window_count.borrow_mut();
             *count -= 1;
             if *count <= 0 {
                 drop(count);
-                let _ = self.ctx.event_loop_proxy().and_then(|p| p.quit_event_loop().ok());
+                let _ = self.context().event_loop_proxy().and_then(|p| p.quit_event_loop().ok());
             }
         }
         result
@@ -1490,22 +1484,14 @@ impl WindowInner {
         }
     }
 
-    pub(crate) fn set_window_item_safe_area(
-        &self,
-        top: crate::lengths::LogicalLength,
-        bottom: crate::lengths::LogicalLength,
-        left: crate::lengths::LogicalLength,
-        right: crate::lengths::LogicalLength,
-    ) {
+    /// The safe area of the window has changed.
+    pub fn set_window_item_safe_area(&self, inset: crate::lengths::LogicalEdges) {
         if let Some(component_rc) = self.try_component() {
             let component = ItemTreeRc::borrow_pin(&component_rc);
             let root_item = component.as_ref().get_item_ref(0);
             if let Some(window_item) = ItemRef::downcast_pin::<crate::items::WindowItem>(root_item)
             {
-                window_item.safe_area_inset_top.set(top);
-                window_item.safe_area_inset_bottom.set(bottom);
-                window_item.safe_area_inset_left.set(left);
-                window_item.safe_area_inset_right.set(right);
+                window_item.safe_area_insets.set(inset);
             }
         }
     }
@@ -1523,14 +1509,8 @@ impl WindowInner {
         let Some(window_item) = ItemRef::downcast_pin::<crate::items::WindowItem>(root_item) else {
             return;
         };
-        for (property, value) in [
-            (&window_item.virtual_keyboard_x, origin.x),
-            (&window_item.virtual_keyboard_y, origin.y),
-            (&window_item.virtual_keyboard_width, size.width),
-            (&window_item.virtual_keyboard_height, size.height),
-        ] {
-            property.set(LogicalLength::new(value));
-        }
+        window_item.virtual_keyboard_position.set(origin);
+        window_item.virtual_keyboard_size.set(size);
         if let Some(focus_item) = self.focus_item.borrow().upgrade() {
             focus_item.try_scroll_into_visible();
         }
@@ -1543,16 +1523,7 @@ impl WindowInner {
         let component = ItemTreeRc::borrow_pin(&component_rc);
         let root_item = component.as_ref().get_item_ref(0);
         let window_item = ItemRef::downcast_pin::<crate::items::WindowItem>(root_item)?;
-        Some((
-            crate::lengths::LogicalPoint::from_lengths(
-                window_item.virtual_keyboard_x(),
-                window_item.virtual_keyboard_y(),
-            ),
-            crate::lengths::LogicalSize::from_lengths(
-                window_item.virtual_keyboard_width(),
-                window_item.virtual_keyboard_height(),
-            ),
-        ))
+        Some((window_item.virtual_keyboard_position(), window_item.virtual_keyboard_size()))
     }
 
     /// Sets the close_requested callback. The callback will be run when the user tries to close a window.
@@ -1611,7 +1582,7 @@ impl WindowInner {
 
     /// Returns the (context global) xdg app id for use with wayland and x11.
     pub fn xdg_app_id(&self) -> Option<SharedString> {
-        self.ctx.xdg_app_id()
+        self.context().xdg_app_id()
     }
 
     /// Returns the upgraded window adapter
@@ -1626,7 +1597,15 @@ impl WindowInner {
 
     /// Provides access to the Windows' Slint context.
     pub fn context(&self) -> &crate::SlintContext {
-        &self.ctx
+        &self
+            .ctx
+            .get_or_init(|| crate::context::GLOBAL_CONTEXT.with(|ctx| ctx.get().unwrap().clone()))
+    }
+
+    /// Set the SlintContext.
+    /// This needs to be called once before any other functions that would use the context.
+    pub fn set_context(&self, ctx: crate::SlintContext) {
+        self.ctx.set(ctx).map_err(|_| ()).expect("context shouldn't have been set before")
     }
 }
 
@@ -1882,10 +1861,10 @@ pub mod ffi {
                     let cpp_graphics_api = match graphics_api {
                         crate::api::GraphicsAPI::NativeOpenGL { .. } => GraphicsAPI::NativeOpenGL,
                         crate::api::GraphicsAPI::WebGL { .. } => unreachable!(), // We don't support wasm with C++
-                        #[cfg(feature = "unstable-wgpu-26")]
-                        crate::api::GraphicsAPI::WGPU26 { .. } => GraphicsAPI::Inaccessible, // There is no C++ API for wgpu (maybe wgpu c in the future?)
                         #[cfg(feature = "unstable-wgpu-27")]
                         crate::api::GraphicsAPI::WGPU27 { .. } => GraphicsAPI::Inaccessible, // There is no C++ API for wgpu (maybe wgpu c in the future?)
+                        #[cfg(feature = "unstable-wgpu-28")]
+                        crate::api::GraphicsAPI::WGPU28 { .. } => GraphicsAPI::Inaccessible, // There is no C++ API for wgpu (maybe wgpu c in the future?)
                     };
                     (self.callback)(state, cpp_graphics_api, self.user_data)
                 }

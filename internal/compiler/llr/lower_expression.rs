@@ -10,12 +10,13 @@ use smol_str::{SmolStr, format_smolstr};
 
 use super::lower_to_item_tree::{LoweredElement, LoweredSubComponentMapping, LoweringState};
 use super::{
-    Animation, GridLayoutRepeatedElement, LocalMemberReference, MemberReference, PropertyIdx,
-    RepeatedElementIdx,
+    Animation, GridLayoutRepeatedElement, LayoutRepeatedElement, LocalMemberReference,
+    MemberReference, PropertyIdx,
 };
 use crate::expression_tree::{BuiltinFunction, Callable, Expression as tree_Expression};
 use crate::langtype::{BuiltinPrivateStruct, EnumerationValue, Struct, StructName, Type};
 use crate::layout::{GridLayoutCell, Orientation, RowColExpr};
+use crate::llr::ArrayOutput as llr_ArrayOutput;
 use crate::llr::Expression as llr_Expression;
 use crate::namedreference::NamedReference;
 use crate::object_tree::{Element, ElementRc, PropertyAnimation};
@@ -144,9 +145,11 @@ pub fn lower_expression(
             Callable::Builtin(f) => {
                 let mut arguments =
                     arguments.iter().map(|e| lower_expression(e, ctx)).collect::<Vec<_>>();
+                // https://github.com/rust-lang/rust-clippy/issues/16191
+                #[allow(clippy::collapsible_if)]
                 if *f == BuiltinFunction::Translate {
-                    if let llr_Expression::Array { as_model, .. } = &mut arguments[3] {
-                        *as_model = false;
+                    if let llr_Expression::Array { output, .. } = &mut arguments[3] {
+                        *output = llr_ArrayOutput::Slice;
                     }
                     #[cfg(feature = "bundle-translations")]
                     if let Some(translation_builder) = ctx.state.translation_builder.as_mut() {
@@ -212,7 +215,7 @@ pub fn lower_expression(
         tree_Expression::Array { element_ty, values } => llr_Expression::Array {
             element_ty: element_ty.clone(),
             values: values.iter().map(|e| lower_expression(e, ctx)).collect::<_>(),
-            as_model: true,
+            output: llr_ArrayOutput::Model,
         },
         tree_Expression::Struct { ty, values } => llr_Expression::Struct {
             ty: ty.clone(),
@@ -244,6 +247,9 @@ pub fn lower_expression(
                 .collect::<_>(),
         },
         tree_Expression::EnumerationValue(e) => llr_Expression::EnumerationValue(e.clone()),
+        tree_Expression::KeyboardShortcut(ks) => {
+            llr_Expression::KeyboardShortcutLiteral(ks.clone())
+        }
         tree_Expression::ReturnStatement(..) => {
             panic!("The remove return pass should have removed all return")
         }
@@ -259,16 +265,18 @@ pub fn lower_expression(
             entries_per_item: *entries_per_item,
         },
         tree_Expression::OrganizeGridLayout(l) => organize_grid_layout(l, ctx),
-        tree_Expression::ComputeLayoutInfo(l, o) => compute_layout_info(l, *o, ctx),
+        tree_Expression::ComputeBoxLayoutInfo(l, o) => compute_box_layout_info(l, *o, ctx),
         tree_Expression::ComputeGridLayoutInfo {
             layout_organized_data_prop,
             layout,
             orientation,
         } => compute_grid_layout_info(layout_organized_data_prop, layout, *orientation, ctx),
-        tree_Expression::SolveLayout(l, o) => solve_layout(l, *o, ctx),
+        tree_Expression::SolveBoxLayout(l, o) => solve_box_layout(l, *o, ctx),
         tree_Expression::SolveGridLayout { layout_organized_data_prop, layout, orientation } => {
             solve_grid_layout(layout_organized_data_prop, layout, *orientation, ctx)
         }
+        tree_Expression::SolveFlexBoxLayout(l) => solve_flexbox_layout(l, ctx),
+        tree_Expression::ComputeFlexBoxLayoutInfo(l, o) => compute_flexbox_layout_info(l, *o, ctx),
         tree_Expression::MinMax { ty, op, lhs, rhs } => llr_Expression::MinMax {
             ty: ty.clone(),
             op: *op,
@@ -606,6 +614,14 @@ pub fn lower_animation(a: &PropertyAnimation, ctx: &mut ExpressionLoweringCtx<'_
     }
 }
 
+fn empty_int32_slice() -> llr_Expression {
+    llr_Expression::Array {
+        element_ty: Type::Int32,
+        values: Vec::new(),
+        output: llr_ArrayOutput::Slice,
+    }
+}
+
 fn compute_grid_layout_info(
     layout_organized_data_prop: &NamedReference,
     layout: &crate::layout::GridLayout,
@@ -619,20 +635,25 @@ fn compute_grid_layout_info(
         value: o as _,
         enumeration: crate::typeregister::BUILTIN.with(|b| b.enums.Orientation.clone()),
     });
+
     let sub_expression = llr_Expression::ExtraBuiltinFunctionCall {
         function: "grid_layout_info".into(),
         arguments: vec![
             llr_Expression::PropertyReference(organized_cells),
             constraints_result.cells,
             if constraints_result.compute_cells.is_none() {
-                llr_Expression::Array {
-                    element_ty: Type::Int32,
-                    values: Vec::new(),
-                    as_model: false,
-                }
+                empty_int32_slice()
             } else {
                 llr_Expression::ReadLocalVariable {
                     name: "repeated_indices".into(),
+                    ty: Type::Array(Type::Int32.into()),
+                }
+            },
+            if constraints_result.compute_cells.is_none() {
+                empty_int32_slice()
+            } else {
+                llr_Expression::ReadLocalVariable {
+                    name: "repeater_steps".into(),
                     ty: Type::Array(Type::Int32.into()),
                 }
             },
@@ -645,7 +666,8 @@ fn compute_grid_layout_info(
     match constraints_result.compute_cells {
         Some((cells_variable, elements)) => llr_Expression::WithLayoutItemInfo {
             cells_variable,
-            repeater_indices: Some("repeated_indices".into()),
+            repeater_indices_var_name: Some("repeated_indices".into()),
+            repeater_steps_var_name: Some("repeater_steps".into()),
             elements,
             orientation: o,
             sub_expression: Box::new(sub_expression),
@@ -654,42 +676,36 @@ fn compute_grid_layout_info(
     }
 }
 
-fn compute_layout_info(
-    l: &crate::layout::Layout,
+fn compute_box_layout_info(
+    layout: &crate::layout::BoxLayout,
     o: Orientation,
     ctx: &mut ExpressionLoweringCtx,
 ) -> llr_Expression {
-    match l {
-        crate::layout::Layout::GridLayout(_) => {
-            panic!("compute_layout_info called on GridLayout, use compute_grid_layout_info");
+    let (padding, spacing) = generate_layout_padding_and_spacing(&layout.geometry, o, ctx);
+    let bld = box_layout_data(layout, o, ctx);
+    let sub_expression = if o == layout.orientation {
+        llr_Expression::ExtraBuiltinFunctionCall {
+            function: "box_layout_info".into(),
+            arguments: vec![bld.cells, spacing, padding, bld.alignment],
+            return_ty: crate::typeregister::layout_info_type().into(),
         }
-        crate::layout::Layout::BoxLayout(layout) => {
-            let (padding, spacing) = generate_layout_padding_and_spacing(&layout.geometry, o, ctx);
-            let bld = box_layout_data(layout, o, ctx);
-            let sub_expression = if o == layout.orientation {
-                llr_Expression::ExtraBuiltinFunctionCall {
-                    function: "box_layout_info".into(),
-                    arguments: vec![bld.cells, spacing, padding, bld.alignment],
-                    return_ty: crate::typeregister::layout_info_type().into(),
-                }
-            } else {
-                llr_Expression::ExtraBuiltinFunctionCall {
-                    function: "box_layout_info_ortho".into(),
-                    arguments: vec![bld.cells, padding],
-                    return_ty: crate::typeregister::layout_info_type().into(),
-                }
-            };
-            match bld.compute_cells {
-                Some((cells_variable, elements)) => llr_Expression::WithLayoutItemInfo {
-                    cells_variable,
-                    repeater_indices: None,
-                    elements,
-                    orientation: o,
-                    sub_expression: Box::new(sub_expression),
-                },
-                None => sub_expression,
-            }
+    } else {
+        llr_Expression::ExtraBuiltinFunctionCall {
+            function: "box_layout_info_ortho".into(),
+            arguments: vec![bld.cells, padding],
+            return_ty: crate::typeregister::layout_info_type().into(),
         }
+    };
+    match bld.compute_cells {
+        Some((cells_variable, elements)) => llr_Expression::WithLayoutItemInfo {
+            cells_variable,
+            repeater_indices_var_name: None,
+            repeater_steps_var_name: None,
+            elements,
+            orientation: o,
+            sub_expression: Box::new(sub_expression),
+        },
+        None => sub_expression,
     }
 }
 
@@ -713,7 +729,7 @@ fn organize_grid_layout(
         let roles_expr = llr_Expression::Array {
             element_ty: Type::Enumeration(e),
             values: roles,
-            as_model: false,
+            output: llr_ArrayOutput::Slice,
         };
         llr_Expression::ExtraBuiltinFunctionCall {
             function: "organize_dialog_button_layout".into(),
@@ -726,14 +742,18 @@ fn organize_grid_layout(
             arguments: vec![
                 input_data.cells,
                 if input_data.compute_cells.is_none() {
-                    llr_Expression::Array {
-                        element_ty: Type::Int32,
-                        values: Vec::new(),
-                        as_model: false,
-                    }
+                    empty_int32_slice()
                 } else {
                     llr_Expression::ReadLocalVariable {
-                        name: "repeated_indices".into(),
+                        name: SmolStr::new_static("repeated_indices"),
+                        ty: Type::Array(Type::Int32.into()),
+                    }
+                },
+                if input_data.compute_cells.is_none() {
+                    empty_int32_slice()
+                } else {
+                    llr_Expression::ReadLocalVariable {
+                        name: SmolStr::new_static("repeater_steps"),
                         ty: Type::Array(Type::Int32.into()),
                     }
                 },
@@ -743,7 +763,8 @@ fn organize_grid_layout(
         if let Some((cells_variable, elements)) = input_data.compute_cells {
             llr_Expression::WithGridInputData {
                 cells_variable,
-                repeater_indices: Some("repeated_indices".into()),
+                repeater_indices_var_name: SmolStr::new_static("repeated_indices"),
+                repeater_steps_var_name: SmolStr::new_static("repeater_steps"),
                 elements,
                 sub_expression: Box::new(sub_expression),
             }
@@ -780,7 +801,8 @@ fn solve_grid_layout(
     match constraints_result.compute_cells {
         Some((cells_variable, elements)) => llr_Expression::WithLayoutItemInfo {
             cells_variable: cells_variable.clone(),
-            repeater_indices: Some("repeated_indices".into()),
+            repeater_indices_var_name: Some("repeated_indices".into()),
+            repeater_steps_var_name: Some("repeater_steps".into()),
             elements,
             orientation: o,
             sub_expression: Box::new(llr_Expression::ExtraBuiltinFunctionCall {
@@ -796,6 +818,10 @@ fn solve_grid_layout(
                         name: "repeated_indices".into(),
                         ty: Type::Array(Type::Int32.into()),
                     },
+                    llr_Expression::ReadLocalVariable {
+                        name: "repeater_steps".into(),
+                        ty: Type::Array(Type::Int32.into()),
+                    },
                 ],
                 return_ty: Type::LayoutCache,
             }),
@@ -806,76 +832,410 @@ fn solve_grid_layout(
                 data,
                 constraints_result.cells,
                 orientation_expr,
-                llr_Expression::Array {
-                    // empty array of repeated indices
-                    element_ty: Type::Int32,
-                    values: Vec::new(),
-                    as_model: false,
-                },
+                empty_int32_slice(),
+                empty_int32_slice(),
             ],
             return_ty: Type::LayoutCache,
         },
     }
 }
 
-fn solve_layout(
-    l: &crate::layout::Layout,
+fn solve_box_layout(
+    layout: &crate::layout::BoxLayout,
     o: Orientation,
     ctx: &mut ExpressionLoweringCtx,
 ) -> llr_Expression {
-    match l {
-        crate::layout::Layout::BoxLayout(layout) => {
-            let (padding, spacing) = generate_layout_padding_and_spacing(&layout.geometry, o, ctx);
-            let bld = box_layout_data(layout, o, ctx);
-            let size = layout_geometry_size(&layout.geometry.rect, o, ctx);
-            let data = make_struct(
-                BuiltinPrivateStruct::BoxLayoutData,
-                [
-                    ("size", Type::Float32, size),
-                    ("spacing", Type::Float32, spacing),
-                    ("padding", padding.ty(ctx), padding),
-                    (
-                        "alignment",
-                        crate::typeregister::BUILTIN
-                            .with(|e| Type::Enumeration(e.enums.LayoutAlignment.clone())),
-                        bld.alignment,
-                    ),
-                    ("cells", bld.cells.ty(ctx), bld.cells),
+    let (padding, spacing) = generate_layout_padding_and_spacing(&layout.geometry, o, ctx);
+    let bld = box_layout_data(layout, o, ctx);
+    let size = layout_geometry_size(&layout.geometry.rect, o, ctx);
+    let data = make_struct(
+        BuiltinPrivateStruct::BoxLayoutData,
+        [
+            ("size", Type::Float32, size),
+            ("spacing", Type::Float32, spacing),
+            ("padding", padding.ty(ctx), padding),
+            (
+                "alignment",
+                crate::typeregister::BUILTIN
+                    .with(|e| Type::Enumeration(e.enums.LayoutAlignment.clone())),
+                bld.alignment,
+            ),
+            ("cells", bld.cells.ty(ctx), bld.cells),
+        ],
+    );
+    match bld.compute_cells {
+        Some((cells_variable, elements)) => llr_Expression::WithLayoutItemInfo {
+            cells_variable,
+            repeater_indices_var_name: Some("repeated_indices".into()),
+            repeater_steps_var_name: None,
+            elements,
+            orientation: o,
+            sub_expression: Box::new(llr_Expression::ExtraBuiltinFunctionCall {
+                function: "solve_box_layout".into(),
+                arguments: vec![
+                    data,
+                    llr_Expression::ReadLocalVariable {
+                        name: "repeated_indices".into(),
+                        ty: Type::Array(Type::Int32.into()),
+                    },
                 ],
-            );
-            match bld.compute_cells {
-                Some((cells_variable, elements)) => llr_Expression::WithLayoutItemInfo {
-                    cells_variable,
-                    repeater_indices: Some("repeated_indices".into()),
+                return_ty: Type::LayoutCache,
+            }),
+        },
+        None => llr_Expression::ExtraBuiltinFunctionCall {
+            function: "solve_box_layout".into(),
+            arguments: vec![data, empty_int32_slice()],
+            return_ty: Type::LayoutCache,
+        },
+    }
+}
+
+fn solve_flexbox_layout(
+    layout: &crate::layout::FlexBoxLayout,
+    ctx: &mut ExpressionLoweringCtx,
+) -> llr_Expression {
+    let (padding_h, spacing_h) =
+        generate_layout_padding_and_spacing(&layout.geometry, Orientation::Horizontal, ctx);
+    let (padding_v, spacing_v) =
+        generate_layout_padding_and_spacing(&layout.geometry, Orientation::Vertical, ctx);
+    let fld = flexbox_layout_data(layout, ctx);
+    let width = layout_geometry_size(&layout.geometry.rect, Orientation::Horizontal, ctx);
+    let height = layout_geometry_size(&layout.geometry.rect, Orientation::Vertical, ctx);
+    let data = make_struct(
+        BuiltinPrivateStruct::FlexBoxLayoutData,
+        [
+            ("width", Type::Float32, width),
+            ("height", Type::Float32, height),
+            ("spacing_h", Type::Float32, spacing_h),
+            ("spacing_v", Type::Float32, spacing_v),
+            ("padding_h", padding_h.ty(ctx), padding_h),
+            ("padding_v", padding_v.ty(ctx), padding_v),
+            (
+                "direction",
+                crate::typeregister::BUILTIN
+                    .with(|e| Type::Enumeration(e.enums.FlexDirection.clone())),
+                fld.direction,
+            ),
+            ("cells_h", fld.cells_h.ty(ctx), fld.cells_h),
+            ("cells_v", fld.cells_v.ty(ctx), fld.cells_v),
+        ],
+    );
+    match fld.compute_cells {
+        Some((cells_h_var, cells_v_var, elements)) => llr_Expression::WithFlexBoxLayoutItemInfo {
+            cells_h_variable: cells_h_var,
+            cells_v_variable: cells_v_var,
+            repeater_indices_var_name: Some("repeated_indices".into()),
+            elements,
+            sub_expression: Box::new(llr_Expression::ExtraBuiltinFunctionCall {
+                function: "solve_flexbox_layout".into(),
+                arguments: vec![
+                    data,
+                    llr_Expression::ReadLocalVariable {
+                        name: "repeated_indices".into(),
+                        ty: Type::Array(Type::Int32.into()),
+                    },
+                ],
+                return_ty: Type::LayoutCache,
+            }),
+        },
+        None => llr_Expression::ExtraBuiltinFunctionCall {
+            function: "solve_flexbox_layout".into(),
+            arguments: vec![data, empty_int32_slice()],
+            return_ty: Type::LayoutCache,
+        },
+    }
+}
+
+fn compute_flexbox_layout_info(
+    layout: &crate::layout::FlexBoxLayout,
+    orientation: Orientation,
+    ctx: &mut ExpressionLoweringCtx,
+) -> llr_Expression {
+    let fld = flexbox_layout_data(layout, ctx);
+
+    // Try to determine direction at compile time from constant binding.
+    let compile_time_direction =
+        match layout.direction.as_ref() {
+            None => Some(crate::layout::FlexDirection::Row),
+            Some(nr) => nr.element().borrow().bindings.get(nr.name()).and_then(|binding| {
+                match &binding.borrow().expression {
+                    crate::expression_tree::Expression::EnumerationValue(ev) => match ev.value {
+                        0 => Some(crate::layout::FlexDirection::Row),
+                        1 => Some(crate::layout::FlexDirection::RowReverse),
+                        2 => Some(crate::layout::FlexDirection::Column),
+                        3 => Some(crate::layout::FlexDirection::ColumnReverse),
+                        _ => None,
+                    },
+                    _ => None,
+                }
+            }),
+        };
+
+    if let Some(direction) = compile_time_direction {
+        // If direction is known at compile time, we can optimize by only generating
+        let is_cross_axis = matches!(
+            (direction, orientation),
+            (crate::layout::FlexDirection::Row, Orientation::Vertical)
+                | (crate::layout::FlexDirection::RowReverse, Orientation::Vertical)
+                | (crate::layout::FlexDirection::Column, Orientation::Horizontal)
+                | (crate::layout::FlexDirection::ColumnReverse, Orientation::Horizontal)
+        );
+        compute_flexbox_layout_info_for_direction(layout, orientation, is_cross_axis, fld, ctx)
+    } else {
+        // Direction is not known at compile time - generate runtime conditional
+        // This ensures we only read the constraint (width/height) in the branch where it's needed
+
+        let row_expr = compute_flexbox_layout_info_for_direction(
+            layout,
+            orientation,
+            orientation == Orientation::Vertical, // cross-axis if orientation is vertical
+            fld.clone(),
+            ctx,
+        );
+        let col_expr = compute_flexbox_layout_info_for_direction(
+            layout,
+            orientation,
+            orientation == Orientation::Horizontal, // cross-axis if orientation is horizontal
+            fld,
+            ctx,
+        );
+
+        // Condition: direction == Row || direction == RowReverse
+        let direction_enum = crate::typeregister::BUILTIN.with(|e| e.enums.FlexDirection.clone());
+        let direction_ref = llr_Expression::PropertyReference(
+            ctx.map_property_reference(layout.direction.as_ref().unwrap()),
+        );
+
+        let is_row_condition = llr_Expression::BinaryExpression {
+            lhs: Box::new(llr_Expression::BinaryExpression {
+                lhs: Box::new(direction_ref.clone()),
+                rhs: Box::new(llr_Expression::EnumerationValue(EnumerationValue {
+                    value: 0, // FlexDirection::Row
+                    enumeration: direction_enum.clone(),
+                })),
+                op: '=',
+            }),
+            rhs: Box::new(llr_Expression::BinaryExpression {
+                lhs: Box::new(direction_ref),
+                rhs: Box::new(llr_Expression::EnumerationValue(EnumerationValue {
+                    value: 1, // FlexDirection::RowReverse
+                    enumeration: direction_enum,
+                })),
+                op: '=',
+            }),
+            op: '|',
+        };
+
+        llr_Expression::Condition {
+            condition: Box::new(is_row_condition),
+            true_expr: Box::new(row_expr),
+            false_expr: Box::new(col_expr),
+        }
+    }
+}
+
+fn compute_flexbox_layout_info_for_direction(
+    layout: &crate::layout::FlexBoxLayout,
+    orientation: Orientation,
+    is_cross_axis: bool,
+    fld: FlexBoxLayoutDataResult,
+    ctx: &mut ExpressionLoweringCtx,
+) -> llr_Expression {
+    let (padding_h, spacing_h) =
+        generate_layout_padding_and_spacing(&layout.geometry, Orientation::Horizontal, ctx);
+    let (padding_v, spacing_v) =
+        generate_layout_padding_and_spacing(&layout.geometry, Orientation::Vertical, ctx);
+
+    if is_cross_axis {
+        // Cross-axis: need constraint to handle wrapping
+
+        // For cross-axis, pass the perpendicular dimension as constraint
+        let constraint_size = match orientation {
+            Orientation::Horizontal => {
+                layout_geometry_size(&layout.geometry.rect, Orientation::Vertical, ctx)
+            }
+            Orientation::Vertical => {
+                layout_geometry_size(&layout.geometry.rect, Orientation::Horizontal, ctx)
+            }
+        };
+
+        let orientation_expr = llr_Expression::EnumerationValue(EnumerationValue {
+            value: orientation as usize,
+            enumeration: crate::typeregister::BUILTIN.with(|e| e.enums.Orientation.clone()),
+        });
+
+        let arguments = vec![
+            fld.cells_h,
+            fld.cells_v,
+            spacing_h,
+            spacing_v,
+            padding_h,
+            padding_v,
+            orientation_expr,
+            fld.direction,
+            constraint_size,
+        ];
+
+        match fld.compute_cells {
+            Some((cells_h_var, cells_v_var, elements)) => {
+                llr_Expression::WithFlexBoxLayoutItemInfo {
+                    cells_h_variable: cells_h_var,
+                    cells_v_variable: cells_v_var,
+                    repeater_indices_var_name: None,
                     elements,
-                    orientation: o,
                     sub_expression: Box::new(llr_Expression::ExtraBuiltinFunctionCall {
-                        function: "solve_box_layout".into(),
-                        arguments: vec![
-                            data,
-                            llr_Expression::ReadLocalVariable {
-                                name: "repeated_indices".into(),
-                                ty: Type::Array(Type::Int32.into()),
-                            },
-                        ],
-                        return_ty: Type::LayoutCache,
+                        function: "flexbox_layout_info".into(),
+                        arguments,
+                        return_ty: crate::typeregister::layout_info_type().into(),
                     }),
-                },
-                None => llr_Expression::ExtraBuiltinFunctionCall {
-                    function: "solve_box_layout".into(),
-                    arguments: vec![
-                        data,
-                        llr_Expression::Array {
-                            element_ty: Type::Int32,
-                            values: Vec::new(),
-                            as_model: false,
-                        },
-                    ],
-                    return_ty: Type::LayoutCache,
-                },
+                }
+            }
+            None => llr_Expression::ExtraBuiltinFunctionCall {
+                function: "flexbox_layout_info".into(),
+                arguments,
+                return_ty: crate::typeregister::layout_info_type().into(),
+            },
+        }
+    } else {
+        // Main axis: determine minimum size
+        let arguments = vec![
+            fld.cells_h,
+            fld.cells_v,
+            spacing_h,
+            spacing_v,
+            padding_h,
+            padding_v,
+            llr_Expression::EnumerationValue(EnumerationValue {
+                value: orientation as usize,
+                enumeration: crate::typeregister::BUILTIN.with(|e| e.enums.Orientation.clone()),
+            }),
+            fld.direction,
+            llr_Expression::NumberLiteral(f32::MAX.into()),
+        ];
+
+        match fld.compute_cells {
+            Some((cells_h_var, cells_v_var, elements)) => {
+                llr_Expression::WithFlexBoxLayoutItemInfo {
+                    cells_h_variable: cells_h_var,
+                    cells_v_variable: cells_v_var,
+                    repeater_indices_var_name: None,
+                    elements,
+                    sub_expression: Box::new(llr_Expression::ExtraBuiltinFunctionCall {
+                        function: "flexbox_layout_info".into(),
+                        arguments,
+                        return_ty: crate::typeregister::layout_info_type().into(),
+                    }),
+                }
+            }
+            None => llr_Expression::ExtraBuiltinFunctionCall {
+                function: "flexbox_layout_info".into(),
+                arguments,
+                return_ty: crate::typeregister::layout_info_type().into(),
+            },
+        }
+    }
+}
+
+#[derive(Clone)]
+struct FlexBoxLayoutDataResult {
+    direction: llr_Expression,
+    cells_h: llr_Expression,
+    cells_v: llr_Expression,
+    /// When there are repeaters involved, we need to do a WithFlexBoxLayoutItemInfo with the
+    /// given cells_h/cells_v variable names and elements (each static element has a tuple of (h, v) layout info)
+    compute_cells: Option<(
+        String,
+        String,
+        Vec<Either<(llr_Expression, llr_Expression), LayoutRepeatedElement>>,
+    )>,
+}
+
+fn flexbox_layout_data(
+    layout: &crate::layout::FlexBoxLayout,
+    ctx: &mut ExpressionLoweringCtx,
+) -> FlexBoxLayoutDataResult {
+    let direction = if let Some(expr) = &layout.direction {
+        llr_Expression::PropertyReference(ctx.map_property_reference(expr))
+    } else {
+        let e = crate::typeregister::BUILTIN.with(|e| e.enums.FlexDirection.clone());
+        llr_Expression::EnumerationValue(EnumerationValue {
+            value: e.default_value,
+            enumeration: e,
+        })
+    };
+
+    let repeater_count =
+        layout.elems.iter().filter(|i| i.element.borrow().repeated.is_some()).count();
+
+    let element_ty = crate::typeregister::box_layout_cell_data_type();
+
+    if repeater_count == 0 {
+        let cells_h = llr_Expression::Array {
+            values: layout
+                .elems
+                .iter()
+                .map(|li| {
+                    let layout_info_h =
+                        get_layout_info(&li.element, ctx, &li.constraints, Orientation::Horizontal);
+                    make_layout_cell_data_struct(layout_info_h)
+                })
+                .collect(),
+            element_ty: element_ty.clone(),
+            output: llr_ArrayOutput::Slice,
+        };
+        let cells_v = llr_Expression::Array {
+            values: layout
+                .elems
+                .iter()
+                .map(|li| {
+                    let layout_info_v =
+                        get_layout_info(&li.element, ctx, &li.constraints, Orientation::Vertical);
+                    make_layout_cell_data_struct(layout_info_v)
+                })
+                .collect(),
+            element_ty,
+            output: llr_ArrayOutput::Slice,
+        };
+        FlexBoxLayoutDataResult { direction, cells_h, cells_v, compute_cells: None }
+    } else {
+        let mut elements = Vec::new();
+        for item in &layout.elems {
+            if item.element.borrow().repeated.is_some() {
+                let repeater_index =
+                    match ctx.mapping.element_mapping.get(&item.element.clone().into()).unwrap() {
+                        LoweredElement::Repeated { repeated_index } => *repeated_index,
+                        _ => panic!(),
+                    };
+                elements.push(Either::Right(LayoutRepeatedElement {
+                    repeater_index,
+                    repeated_children_count: None,
+                }))
+            } else {
+                // For static elements, we need both orientations
+                let layout_info_h =
+                    get_layout_info(&item.element, ctx, &item.constraints, Orientation::Horizontal);
+                let layout_info_v =
+                    get_layout_info(&item.element, ctx, &item.constraints, Orientation::Vertical);
+                elements.push(Either::Left((
+                    make_layout_cell_data_struct(layout_info_h),
+                    make_layout_cell_data_struct(layout_info_v),
+                )));
             }
         }
-        _ => panic!("solve_layout is only supported for BoxLayout"),
+        let cells_h = llr_Expression::ReadLocalVariable {
+            name: "cells_h".into(),
+            ty: Type::Array(Rc::new(crate::typeregister::layout_info_type().into())),
+        };
+        let cells_v = llr_Expression::ReadLocalVariable {
+            name: "cells_v".into(),
+            ty: Type::Array(Rc::new(crate::typeregister::layout_info_type().into())),
+        };
+        FlexBoxLayoutDataResult {
+            direction,
+            cells_h,
+            cells_v,
+            compute_cells: Some(("cells_h".into(), "cells_v".into(), elements)),
+        }
     }
 }
 
@@ -884,7 +1244,7 @@ struct BoxLayoutDataResult {
     cells: llr_Expression,
     /// When there are repeater involved, we need to do a WithLayoutItemInfo with the
     /// given cell variable and elements
-    compute_cells: Option<(String, Vec<Either<llr_Expression, RepeatedElementIdx>>)>,
+    compute_cells: Option<(String, Vec<Either<llr_Expression, LayoutRepeatedElement>>)>,
 }
 
 fn make_layout_cell_data_struct(layout_info: llr_Expression) -> llr_Expression {
@@ -926,7 +1286,7 @@ fn box_layout_data(
                 })
                 .collect(),
             element_ty,
-            as_model: false,
+            output: llr_ArrayOutput::Slice,
         };
         BoxLayoutDataResult { alignment, cells, compute_cells: None }
     } else {
@@ -938,7 +1298,10 @@ fn box_layout_data(
                         LoweredElement::Repeated { repeated_index } => *repeated_index,
                         _ => panic!(),
                     };
-                elements.push(Either::Right(repeater_index))
+                elements.push(Either::Right(LayoutRepeatedElement {
+                    repeater_index,
+                    repeated_children_count: None,
+                }))
             } else {
                 let layout_info =
                     get_layout_info(&item.element, ctx, &item.constraints, orientation);
@@ -957,7 +1320,7 @@ struct GridLayoutCellConstraintsResult {
     cells: llr_Expression,
     /// When there are repeater involved, we need to do a WithLayoutItemInfo with the
     /// given cell variable and elements
-    compute_cells: Option<(String, Vec<Either<llr_Expression, RepeatedElementIdx>>)>,
+    compute_cells: Option<(String, Vec<Either<llr_Expression, LayoutRepeatedElement>>)>,
 }
 
 fn grid_layout_cell_constraints(
@@ -972,7 +1335,7 @@ fn grid_layout_cell_constraints(
 
     if repeater_count == 0 {
         let cells = llr_Expression::Array {
-            element_ty: element_ty,
+            element_ty,
             values: layout
                 .elems
                 .iter()
@@ -982,11 +1345,11 @@ fn grid_layout_cell_constraints(
                     make_layout_cell_data_struct(layout_info)
                 })
                 .collect(),
-            as_model: false,
+            output: llr_ArrayOutput::Slice,
         };
         GridLayoutCellConstraintsResult { cells, compute_cells: None }
     } else {
-        let mut elements = vec![];
+        let mut elements = Vec::new();
         for item in &layout.elems {
             if item.item.element.borrow().repeated.is_some() {
                 let repeater_index = match ctx
@@ -998,7 +1361,12 @@ fn grid_layout_cell_constraints(
                     LoweredElement::Repeated { repeated_index } => *repeated_index,
                     _ => panic!(),
                 };
-                elements.push(Either::Right(repeater_index))
+                let cell = item.cell.borrow();
+                let repeated_children_count = cell.child_items.as_ref().map(|c| c.len());
+                elements.push(Either::Right(LayoutRepeatedElement {
+                    repeater_index,
+                    repeated_children_count,
+                }));
             } else {
                 let layout_info =
                     get_layout_info(&item.item.element, ctx, &item.item.constraints, orientation);
@@ -1066,11 +1434,11 @@ fn grid_layout_input_data(
                     )
                 })
                 .collect(),
-            as_model: false,
+            output: llr_ArrayOutput::Slice,
         };
         GridLayoutInputDataResult { cells, compute_cells: None }
     } else {
-        let mut elements = vec![];
+        let mut elements = Vec::new();
         let mut after_repeater_in_same_row = false;
         for item in &layout.elems {
             let new_row = item.cell.borrow().new_row;
@@ -1087,7 +1455,10 @@ fn grid_layout_input_data(
                     LoweredElement::Repeated { repeated_index } => *repeated_index,
                     _ => panic!(),
                 };
-                let repeated_element = GridLayoutRepeatedElement { new_row, repeater_index };
+                let cell = item.cell.borrow();
+                let repeated_children_count = cell.child_items.as_ref().map(|c| c.len());
+                let repeated_element =
+                    GridLayoutRepeatedElement { new_row, repeater_index, repeated_children_count };
                 elements.push(Either::Right(repeated_element));
                 after_repeater_in_same_row = true;
             } else {
@@ -1206,14 +1577,14 @@ pub fn get_layout_info(
     }
 }
 
+// Called for repeated components in a grid layout, to generate code to provide input for organize_grid_layout().
 pub fn get_grid_layout_input_for_repeated(
     ctx: &mut ExpressionLoweringCtx,
     grid_cell: &GridLayoutCell,
 ) -> llr_Expression {
-    let new_row_expr =
-        llr_Expression::ReadLocalVariable { name: SmolStr::new_static("new_row"), ty: Type::Bool };
+    let mut assignments = Vec::new();
 
-    fn convert_row_col_expr(expr: &RowColExpr, ctx: &mut ExpressionLoweringCtx) -> llr_Expression {
+    fn convert_row_col_expr(expr: &RowColExpr, ctx: &ExpressionLoweringCtx) -> llr_Expression {
         match expr {
             RowColExpr::Literal(n) => llr_Expression::NumberLiteral((*n).into()),
             RowColExpr::Named(nr) => {
@@ -1223,16 +1594,53 @@ pub fn get_grid_layout_input_for_repeated(
         }
     }
 
-    make_struct(
-        BuiltinPrivateStruct::GridLayoutInputData,
-        [
-            ("new_row", Type::Bool, new_row_expr),
-            ("row", Type::Float32, convert_row_col_expr(&grid_cell.row_expr, ctx)),
-            ("col", Type::Float32, convert_row_col_expr(&grid_cell.col_expr, ctx)),
-            ("rowspan", Type::Float32, convert_row_col_expr(&grid_cell.rowspan_expr, ctx)),
-            ("colspan", Type::Float32, convert_row_col_expr(&grid_cell.colspan_expr, ctx)),
-        ],
-    )
+    // Generate assignments to the `result` slice parameter: result[i] = struct { ... }
+    let mut push_assignment =
+        |i: usize, new_row_expr: &llr_Expression, grid_cell: &GridLayoutCell| {
+            let row = convert_row_col_expr(&grid_cell.row_expr, &*ctx);
+            let col = convert_row_col_expr(&grid_cell.col_expr, &*ctx);
+            let rowspan = convert_row_col_expr(&grid_cell.rowspan_expr, &*ctx);
+            let colspan = convert_row_col_expr(&grid_cell.colspan_expr, &*ctx);
+            let value = make_struct(
+                BuiltinPrivateStruct::GridLayoutInputData,
+                [
+                    ("new_row", Type::Bool, new_row_expr.clone()),
+                    ("row", Type::Float32, row),
+                    ("col", Type::Float32, col),
+                    ("rowspan", Type::Float32, rowspan),
+                    ("colspan", Type::Float32, colspan),
+                ],
+            );
+            assignments.push(llr_Expression::SliceIndexAssignment {
+                slice_name: SmolStr::new_static("result"),
+                index: i,
+                value: value.into(),
+            });
+        };
+
+    if let Some(child_items) = grid_cell.child_items.as_ref() {
+        // Repeated Row
+        let mut new_row_expr = llr_Expression::BoolLiteral(true);
+        for (i, child_item) in child_items.iter().enumerate() {
+            let child_element = child_item.element.borrow();
+            let child_cell = child_element.grid_layout_cell.as_ref().unwrap().borrow();
+            push_assignment(i, &new_row_expr, &child_cell);
+            new_row_expr = llr_Expression::BoolLiteral(false);
+        }
+    } else {
+        // Single repeated item
+        // grid_cell.new_row is the static information from the slint file.
+        // In practice, for repeated items within a row, whether we should start a new row
+        // is more dynamic (e.g. if the previous item was in "if false"),
+        // and tracked by a local variable "new_row" in the generated code.
+        let new_row_expr = llr_Expression::ReadLocalVariable {
+            name: SmolStr::new_static("new_row"),
+            ty: Type::Bool,
+        };
+        push_assignment(0, &new_row_expr, grid_cell);
+    }
+
+    llr_Expression::CodeBlock(assignments)
 }
 
 fn compile_path(
@@ -1244,7 +1652,7 @@ fn compile_path(
             from: llr_Expression::Array {
                 element_ty: crate::typeregister::path_element_type(),
                 values: elements,
-                as_model: false,
+                output: llr_ArrayOutput::Slice,
             }
             .into(),
             to: Type::PathData,
@@ -1328,7 +1736,7 @@ fn compile_path(
                             llr_Expression::Array {
                                 element_ty: event_type,
                                 values: events,
-                                as_model: false,
+                                output: llr_ArrayOutput::Slice,
                             },
                         ),
                         (
@@ -1336,7 +1744,7 @@ fn compile_path(
                             llr_Expression::Array {
                                 element_ty: point_type,
                                 values: points,
-                                as_model: false,
+                                output: llr_ArrayOutput::Slice,
                             },
                         ),
                     ])

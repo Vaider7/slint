@@ -11,7 +11,7 @@ pub use i_slint_core::tests::slint_get_mocked_time as get_mocked_time;
 pub use i_slint_core::tests::slint_mock_elapsed_time as mock_elapsed_time;
 use i_slint_core::window::WindowInner;
 
-/// Simulate a mouse click
+/// Simulate a mouse click at `(x, y)` and release after a while at the same position
 pub fn send_mouse_click<
     X: vtable::HasStaticVTable<i_slint_core::item_tree::ItemTreeVTable> + 'static,
     Component: Into<vtable::VRc<i_slint_core::item_tree::ItemTreeVTable, X>> + ComponentHandle,
@@ -25,6 +25,23 @@ pub fn send_mouse_click<
         y,
         &WindowInner::from_pub(component.window()).window_adapter(),
     );
+}
+
+/// Simulate entering a keyboard shortcut or other "nested" character sequence
+pub fn send_keyboard_shortcut<
+    X: vtable::HasStaticVTable<i_slint_core::item_tree::ItemTreeVTable>,
+    Component: Into<vtable::VRc<i_slint_core::item_tree::ItemTreeVTable, X>> + ComponentHandle,
+>(
+    component: &Component,
+    keys: impl IntoIterator<Item = impl Into<char>>,
+) {
+    let keys: Vec<_> = keys.into_iter().map(Into::into).collect();
+    for key in &keys {
+        send_keyboard_char(component, key.clone(), true);
+    }
+    for key in keys.iter().rev() {
+        send_keyboard_char(component, key.clone(), false);
+    }
 }
 
 /// Simulate entering a sequence of ascii characters key by (pressed or released).
@@ -79,4 +96,18 @@ pub fn access_testing_window<R>(
         .and_then(|wa| (wa as &dyn core::any::Any).downcast_ref::<TestingWindow>())
         .map(callback)
         .expect("access_testing_window called without testing backend/adapter")
+}
+
+/// Runs a future to completion by polling the future and updating the mock time until the future is ready
+pub fn block_on<R>(future: impl Future<Output = R>) -> R {
+    let mut pinned = core::pin::pin!(future);
+    let mut ctx = core::task::Context::from_waker(core::task::Waker::noop());
+    loop {
+        if let core::task::Poll::Ready(r) = pinned.as_mut().poll(&mut ctx) {
+            return r;
+        }
+        let duration = i_slint_core::platform::duration_until_next_timer_update()
+            .unwrap_or(core::time::Duration::from_secs(1));
+        mock_elapsed_time(duration.as_millis() as u64);
+    }
 }

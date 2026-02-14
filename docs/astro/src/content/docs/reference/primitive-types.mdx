@@ -81,6 +81,29 @@ export component ChangeCaseOfString {
 }
 ```
 
+The `to-float` method can be used to convert `string` to a `float`. It returns 0 if the string isn’t a valid number. You can check with `is-float` if the string contains a valid number.
+
+```slint
+export component StringToFloat {
+    property<float> hello: "hello".to-float(); // 0
+    property<bool> goodbye: "goodbye".is-float(); // false
+    property<float> value: "1.5".to-float(); // 1.5
+}
+```
+
+</SlintProperty>
+
+### styled-text
+<SlintProperty propName="styled-text" typeName="styled-text" defaultValue='""'>
+
+A property that is used with the <Link type="StyledText" label="StyledText element"/>.
+
+Create styled text with the `@markdown()` macro. For example: `@markdown("Hello **Bold**")`.
+
+`@markdown()` supports interpolation1: For example, `@markdown("Hello *{}*", "World")` becomes `"Hello *World*"`.
+
+Any text passed as an argument to the macro will be escaped, for example `@markdown("Hello {}", "*World*")` will become `"Hello \*World\*"`.
+
 </SlintProperty>
 
 ## Numeric Types
@@ -138,6 +161,15 @@ A brush is a special type that can be either initialized from a `color` or a `gr
 ### color
 <SlintProperty propName="color" typeName="color" defaultValue='transparent'>
 RGB color with an alpha channel, with 8 bit precision for each channel. CSS color names as well as the hexadecimal color encodings are supported, such as #RRGGBBAA or #RGB. See <Link type="ColorsRef" label="Colors & Brushes" />.
+</SlintProperty>
+
+## Keyboard input
+
+### keyboard-shortcut
+<SlintProperty propName="keyboard-shortcut" typeName="keyboard-shortcut" defaultValue='empty shortcut'>
+A keyboard-shortcut represents a key combined with a list of modifiers.
+This is the primitive type used to detect if a KeyEvent should trigger a given shortcut.
+See <Link type="KeyboardInput" label="Key Handling" />.
 </SlintProperty>
 
 ## Images

@@ -3,7 +3,7 @@
 
 use crate::diagnostics::{BuildDiagnostics, SourceLocation, Spanned};
 use crate::langtype::{
-    BuiltinElement, BuiltinPublicStruct, EnumerationValue, Function, Struct, Type,
+    BuiltinElement, BuiltinPublicStruct, EnumerationValue, Function, KeyboardShortcut, Struct, Type,
 };
 use crate::layout::Orientation;
 use crate::lookup::LookupCtx;
@@ -75,6 +75,7 @@ pub enum BuiltinFunction {
     StringToUppercase,
     ColorRgbaStruct,
     ColorHsvaStruct,
+    ColorOklchStruct,
     ColorBrighter,
     ColorDarker,
     ColorTransparentize,
@@ -84,6 +85,7 @@ pub enum BuiltinFunction {
     ArrayLength,
     Rgb,
     Hsv,
+    Oklch,
     ColorScheme,
     SupportsNativeMenuBar,
     /// Setup the menu bar
@@ -102,6 +104,7 @@ pub enum BuiltinFunction {
     ParseDate,
     TextInputFocused,
     SetTextInputFocused,
+    KeyboardShortcutMatches,
     ImplicitLayoutInfo(Orientation),
     ItemAbsolutePosition,
     RegisterCustomFontByPath,
@@ -113,7 +116,6 @@ pub enum BuiltinFunction {
     StartTimer,
     StopTimer,
     RestartTimer,
-    OpenUrl,
     ParseMarkdown,
     EscapeMarkdown,
 }
@@ -142,6 +144,7 @@ pub enum BuiltinMacroFunction {
     /// transform the argument so it is always rgb(r, g, b, a) with r, g, b between 0 and 255.
     Rgb,
     Hsv,
+    Oklch,
     /// transform `debug(a, b, c)` into debug `a + " " + b + " " + c`
     Debug,
 }
@@ -231,6 +234,16 @@ declare_builtin_function_types!(
         .collect(),
         name: BuiltinPublicStruct::Color.into(),
     })),
+    ColorOklchStruct: (Type::Color) -> Type::Struct(Rc::new(Struct {
+        fields: IntoIterator::into_iter([
+            (SmolStr::new_static("lightness"), Type::Float32),
+            (SmolStr::new_static("chroma"), Type::Float32),
+            (SmolStr::new_static("hue"), Type::Float32),
+            (SmolStr::new_static("alpha"), Type::Float32),
+        ])
+        .collect(),
+        name: BuiltinPublicStruct::Color.into(),
+    })),
     ColorBrighter: (Type::Brush, Type::Float32) -> Type::Brush,
     ColorDarker: (Type::Brush, Type::Float32) -> Type::Brush,
     ColorTransparentize: (Type::Brush, Type::Float32) -> Type::Brush,
@@ -247,6 +260,7 @@ declare_builtin_function_types!(
     ArrayLength: (Type::Model) -> Type::Int32,
     Rgb: (Type::Int32, Type::Int32, Type::Int32, Type::Float32) -> Type::Color,
     Hsv: (Type::Float32, Type::Float32, Type::Float32, Type::Float32) -> Type::Color,
+    Oklch: (Type::Float32, Type::Float32, Type::Float32, Type::Float32) -> Type::Color,
     ColorScheme: () -> Type::Enumeration(
         typeregister::BUILTIN.with(|e| e.enums.ColorScheme.clone()),
     ),
@@ -257,6 +271,7 @@ declare_builtin_function_types!(
     MonthOffset: (Type::Int32, Type::Int32) -> Type::Int32,
     FormatDate: (Type::String, Type::Int32, Type::Int32, Type::Int32) -> Type::String,
     TextInputFocused: () -> Type::Bool,
+    KeyboardShortcutMatches: (Type::KeyboardShortcutType, typeregister::builtin_structs::KeyEvent().into()) -> Type::Bool,
     DateNow: () -> Type::Array(Rc::new(Type::Int32)),
     ValidDate: (Type::String, Type::String) -> Type::Bool,
     ParseDate: (Type::String, Type::String) -> Type::Array(Rc::new(Type::Int32)),
@@ -275,10 +290,15 @@ declare_builtin_function_types!(
     StartTimer: (Type::ElementReference) -> Type::Void,
     StopTimer: (Type::ElementReference) -> Type::Void,
     RestartTimer: (Type::ElementReference) -> Type::Void,
-    OpenUrl: (Type::String) -> Type::Void,
     EscapeMarkdown: (Type::String) -> Type::String,
     ParseMarkdown: (Type::String) -> Type::StyledText
 );
+
+impl Default for BuiltinFunctionTypes {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl BuiltinFunction {
     pub fn ty(&self) -> Rc<Function> {
@@ -343,6 +363,7 @@ impl BuiltinFunction {
             | BuiltinFunction::StringToUppercase => true,
             BuiltinFunction::ColorRgbaStruct
             | BuiltinFunction::ColorHsvaStruct
+            | BuiltinFunction::ColorOklchStruct
             | BuiltinFunction::ColorBrighter
             | BuiltinFunction::ColorDarker
             | BuiltinFunction::ColorTransparentize
@@ -359,8 +380,10 @@ impl BuiltinFunction {
             BuiltinFunction::ArrayLength => true,
             BuiltinFunction::Rgb => true,
             BuiltinFunction::Hsv => true,
+            BuiltinFunction::Oklch => true,
             BuiltinFunction::SetTextInputFocused => false,
             BuiltinFunction::TextInputFocused => false,
+            BuiltinFunction::KeyboardShortcutMatches => true,
             BuiltinFunction::ImplicitLayoutInfo(_) => false,
             BuiltinFunction::ItemAbsolutePosition => true,
             BuiltinFunction::RegisterCustomFontByPath
@@ -373,7 +396,6 @@ impl BuiltinFunction {
             BuiltinFunction::StartTimer => false,
             BuiltinFunction::StopTimer => false,
             BuiltinFunction::RestartTimer => false,
-            BuiltinFunction::OpenUrl => false,
             BuiltinFunction::ParseMarkdown | BuiltinFunction::EscapeMarkdown => false,
         }
     }
@@ -429,6 +451,7 @@ impl BuiltinFunction {
             | BuiltinFunction::StringToUppercase => true,
             BuiltinFunction::ColorRgbaStruct
             | BuiltinFunction::ColorHsvaStruct
+            | BuiltinFunction::ColorOklchStruct
             | BuiltinFunction::ColorBrighter
             | BuiltinFunction::ColorDarker
             | BuiltinFunction::ColorTransparentize
@@ -438,10 +461,12 @@ impl BuiltinFunction {
             BuiltinFunction::ArrayLength => true,
             BuiltinFunction::Rgb => true,
             BuiltinFunction::Hsv => true,
+            BuiltinFunction::Oklch => true,
             BuiltinFunction::ImplicitLayoutInfo(_) => true,
             BuiltinFunction::ItemAbsolutePosition => true,
             BuiltinFunction::SetTextInputFocused => false,
             BuiltinFunction::TextInputFocused => true,
+            BuiltinFunction::KeyboardShortcutMatches => true,
             BuiltinFunction::RegisterCustomFontByPath
             | BuiltinFunction::RegisterCustomFontByMemory
             | BuiltinFunction::RegisterBitmapFont => false,
@@ -452,7 +477,6 @@ impl BuiltinFunction {
             BuiltinFunction::StartTimer => false,
             BuiltinFunction::StopTimer => false,
             BuiltinFunction::RestartTimer => false,
-            BuiltinFunction::OpenUrl => false,
             BuiltinFunction::ParseMarkdown | BuiltinFunction::EscapeMarkdown => true,
         }
     }
@@ -582,6 +606,7 @@ declare_units! {
     Rad = "rad" -> Angle * 360./std::f32::consts::TAU,
 }
 
+#[allow(clippy::derivable_impls)] // more readable this way
 impl Default for Unit {
     fn default() -> Self {
         Self::None
@@ -749,6 +774,8 @@ pub enum Expression {
 
     EnumerationValue(EnumerationValue),
 
+    KeyboardShortcut(KeyboardShortcut),
+
     ReturnStatement(Option<Box<Expression>>),
 
     LayoutCacheAccess {
@@ -759,28 +786,34 @@ pub enum Expression {
         /// When set, this is the index within a repeater, and the index is then the location of another offset.
         /// So this looks like `layout_cache_prop[layout_cache_prop[index] + repeater_index * entries_per_item]`
         repeater_index: Option<Box<Expression>>,
-        /// The number of entries per item (2 for LayoutCache, 4 for GridLayoutInputData)
+        /// The number of entries to skip per repeater iteration.
         /// This is only used when repeater_index is set
+        /// This is `base_entries_per_item * step` where base is 2 for LayoutCache or 4 for GridLayoutInputData,
+        /// and step is the number of children in a repeated Row (1 for non-Row elements)
         entries_per_item: usize,
     },
 
     /// Organize a grid layout, i.e. decide what goes where
     OrganizeGridLayout(crate::layout::GridLayout),
 
-    /// Compute the LayoutInfo for the given layout.
+    /// Compute the LayoutInfo for the given box layout.
     /// The orientation is the orientation of the cache, not the orientation of the layout
-    ComputeLayoutInfo(crate::layout::Layout, crate::layout::Orientation),
+    ComputeBoxLayoutInfo(crate::layout::BoxLayout, crate::layout::Orientation),
     ComputeGridLayoutInfo {
         layout_organized_data_prop: NamedReference,
         layout: crate::layout::GridLayout,
         orientation: crate::layout::Orientation,
     },
-    SolveLayout(crate::layout::Layout, crate::layout::Orientation),
+    SolveBoxLayout(crate::layout::BoxLayout, crate::layout::Orientation),
     SolveGridLayout {
         layout_organized_data_prop: NamedReference,
         layout: crate::layout::GridLayout,
         orientation: crate::layout::Orientation,
     },
+    /// Solve a FlexBoxLayout - returns positions for all items (x, y, width, height per item)
+    SolveFlexBoxLayout(crate::layout::FlexBoxLayout),
+    /// Compute the LayoutInfo for the given FlexBoxLayout
+    ComputeFlexBoxLayoutInfo(crate::layout::FlexBoxLayout, crate::layout::Orientation),
 
     MinMax {
         ty: Type,
@@ -905,14 +938,17 @@ impl Expression {
             Expression::RadialGradient { .. } => Type::Brush,
             Expression::ConicGradient { .. } => Type::Brush,
             Expression::EnumerationValue(value) => Type::Enumeration(value.enumeration.clone()),
+            Expression::KeyboardShortcut(_) => Type::KeyboardShortcutType,
             // invalid because the expression is unreachable
             Expression::ReturnStatement(_) => Type::Invalid,
             Expression::LayoutCacheAccess { .. } => Type::LogicalLength,
             Expression::OrganizeGridLayout(..) => Type::ArrayOfU16,
-            Expression::ComputeLayoutInfo(..) => typeregister::layout_info_type().into(),
+            Expression::ComputeBoxLayoutInfo(..) => typeregister::layout_info_type().into(),
             Expression::ComputeGridLayoutInfo { .. } => typeregister::layout_info_type().into(),
-            Expression::SolveLayout(..) => Type::LayoutCache,
+            Expression::SolveBoxLayout(..) => Type::LayoutCache,
             Expression::SolveGridLayout { .. } => Type::LayoutCache,
+            Expression::SolveFlexBoxLayout(..) => Type::LayoutCache,
+            Expression::ComputeFlexBoxLayoutInfo(..) => typeregister::layout_info_type().into(),
             Expression::MinMax { ty, .. } => ty.clone(),
             Expression::EmptyComponentFactory => Type::ComponentFactory,
             Expression::DebugHook { expression, .. } => expression.ty(),
@@ -1004,6 +1040,7 @@ impl Expression {
                 }
             }
             Expression::EnumerationValue(_) => {}
+            Expression::KeyboardShortcut(_) => {}
             Expression::ReturnStatement(expr) => {
                 expr.as_deref().map(visitor);
             }
@@ -1011,10 +1048,12 @@ impl Expression {
                 repeater_index.as_deref().map(visitor);
             }
             Expression::OrganizeGridLayout(..) => {}
-            Expression::ComputeLayoutInfo(..) => {}
+            Expression::ComputeBoxLayoutInfo(..) => {}
             Expression::ComputeGridLayoutInfo { .. } => {}
-            Expression::SolveLayout(..) => {}
+            Expression::SolveBoxLayout(..) => {}
             Expression::SolveGridLayout { .. } => {}
+            Expression::SolveFlexBoxLayout(..) => {}
+            Expression::ComputeFlexBoxLayoutInfo(..) => {}
             Expression::MinMax { lhs, rhs, .. } => {
                 visitor(lhs);
                 visitor(rhs);
@@ -1111,6 +1150,7 @@ impl Expression {
                 }
             }
             Expression::EnumerationValue(_) => {}
+            Expression::KeyboardShortcut(_) => {}
             Expression::ReturnStatement(expr) => {
                 expr.as_deref_mut().map(visitor);
             }
@@ -1118,10 +1158,12 @@ impl Expression {
                 repeater_index.as_deref_mut().map(visitor);
             }
             Expression::OrganizeGridLayout(..) => {}
-            Expression::ComputeLayoutInfo(..) => {}
+            Expression::ComputeBoxLayoutInfo(..) => {}
             Expression::ComputeGridLayoutInfo { .. } => {}
-            Expression::SolveLayout(..) => {}
+            Expression::SolveBoxLayout(..) => {}
             Expression::SolveGridLayout { .. } => {}
+            Expression::SolveFlexBoxLayout(..) => {}
+            Expression::ComputeFlexBoxLayoutInfo(..) => {}
             Expression::MinMax { lhs, rhs, .. } => {
                 visitor(lhs);
                 visitor(rhs);
@@ -1209,16 +1251,19 @@ impl Expression {
                     && stops.iter().all(|(c, s)| c.is_constant(ga) && s.is_constant(ga))
             }
             Expression::EnumerationValue(_) => true,
+            Expression::KeyboardShortcut(_) => true,
             Expression::ReturnStatement(expr) => {
                 expr.as_ref().is_none_or(|expr| expr.is_constant(ga))
             }
             // TODO:  detect constant property within layouts
             Expression::LayoutCacheAccess { .. } => false,
             Expression::OrganizeGridLayout { .. } => false,
-            Expression::ComputeLayoutInfo(..) => false,
+            Expression::ComputeBoxLayoutInfo(..) => false,
             Expression::ComputeGridLayoutInfo { .. } => false,
-            Expression::SolveLayout(..) => false,
+            Expression::SolveBoxLayout(..) => false,
             Expression::SolveGridLayout { .. } => false,
+            Expression::SolveFlexBoxLayout(..) => false,
+            Expression::ComputeFlexBoxLayoutInfo(..) => false,
             Expression::MinMax { lhs, rhs, .. } => lhs.is_constant(ga) && rhs.is_constant(ga),
             Expression::EmptyComponentFactory => true,
             Expression::DebugHook { .. } => false,
@@ -1461,6 +1506,7 @@ impl Expression {
             Type::Enumeration(enumeration) => {
                 Expression::EnumerationValue(enumeration.clone().default_value())
             }
+            Type::KeyboardShortcutType => Expression::KeyboardShortcut(KeyboardShortcut::default()),
             Type::ComponentFactory => Expression::EmptyComponentFactory,
             Type::StyledText => Expression::Invalid,
         }
@@ -1882,6 +1928,9 @@ pub fn pretty_print(f: &mut dyn std::fmt::Write, expression: &Expression) -> std
             Some(val) => write!(f, "{}.{}", e.enumeration.name, val),
             None => write!(f, "{}.{}", e.enumeration.name, e.value),
         },
+        Expression::KeyboardShortcut(shortcut) => {
+            write!(f, "@keys({shortcut})")
+        }
         Expression::ReturnStatement(e) => {
             write!(f, "return ")?;
             e.as_ref().map(|e| pretty_print(f, e)).unwrap_or(Ok(()))
@@ -1903,10 +1952,12 @@ pub fn pretty_print(f: &mut dyn std::fmt::Write, expression: &Expression) -> std
             }
         }
         Expression::OrganizeGridLayout(..) => write!(f, "organize_grid_layout(..)"),
-        Expression::ComputeLayoutInfo(..) => write!(f, "layout_info(..)"),
+        Expression::ComputeBoxLayoutInfo(..) => write!(f, "layout_info(..)"),
         Expression::ComputeGridLayoutInfo { .. } => write!(f, "grid_layout_info(..)"),
-        Expression::SolveLayout(..) => write!(f, "solve_layout(..)"),
+        Expression::SolveBoxLayout(..) => write!(f, "solve_box_layout(..)"),
         Expression::SolveGridLayout { .. } => write!(f, "solve_grid_layout(..)"),
+        Expression::SolveFlexBoxLayout(..) => write!(f, "solve_flexbox_layout(..)"),
+        Expression::ComputeFlexBoxLayoutInfo(..) => write!(f, "flexbox_layout_info(..)"),
         Expression::MinMax { ty: _, op, lhs, rhs } => {
             match op {
                 MinMaxOp::Min => write!(f, "min(")?,
