@@ -294,17 +294,18 @@ inline SharedString translate(const SharedString &original, const SharedString &
     return result;
 }
 
-inline SharedString escape_markdown(const SharedString &text)
+inline StyledText parse_markdown(SharedString format_string,
+                                 cbindgen_private::Slice<StyledText> args)
 {
-    SharedString result = text;
-    cbindgen_private::slint_escape_markdown(&result);
+    StyledText result;
+    cbindgen_private::slint_parse_markdown(format_string, args, &result);
     return result;
 }
 
-inline StyledText parse_markdown(const SharedString &text)
+inline StyledText string_to_styled_text(SharedString text)
 {
     StyledText result;
-    cbindgen_private::slint_parse_markdown(&text, &result);
+    cbindgen_private::slint_string_to_styled_text(text, &result);
     return result;
 }
 
@@ -333,6 +334,13 @@ translate_from_bundle_with_plural(std::span<const char8_t *const> strs,
                        plural_rules.size());
     cbindgen_private::slint_translate_from_bundle_with_plural(
             strs_slice, indices_slice, plural_rules_slice, arguments, n, &result);
+    return result;
+}
+
+inline SharedString keyboard_shortcut_to_string(const cbindgen_private::KeyboardShortcut &shortcut)
+{
+    SharedString result;
+    cbindgen_private::slint_keyboard_shortcut_to_string(&shortcut, &result);
     return result;
 }
 
@@ -386,6 +394,15 @@ cbindgen_private::Flickable::Flickable()
 cbindgen_private::Flickable::~Flickable()
 {
     slint_flickable_data_free(&data);
+}
+
+cbindgen_private::FocusScope::FocusScope()
+{
+    slint_maybe_shortcut_list_init(&shortcuts);
+}
+cbindgen_private::FocusScope::~FocusScope()
+{
+    slint_maybe_shortcut_list_free(&shortcuts);
 }
 
 cbindgen_private::NativeStyleMetrics::NativeStyleMetrics(void *)

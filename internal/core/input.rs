@@ -52,6 +52,16 @@ pub enum MouseEvent {
     DragMove(DropEvent),
     /// The mouse is released while dragging over this item.
     Drop(DropEvent),
+    /// A platform-recognized pinch gesture (macOS/iOS trackpad, Qt).
+    /// `delta` is the incremental scale change; PinchGestureHandler accumulates it.
+    PinchGesture { position: LogicalPoint, delta: f32, phase: TouchPhase },
+    /// A platform-recognized rotation gesture (macOS/iOS trackpad, Qt).
+    /// `delta` is the incremental rotation in degrees using the platform's sign convention
+    /// (positive = counterclockwise on macOS). PinchGestureHandler negates this internally
+    /// so that its `rotation` property uses positive = clockwise (CSS convention).
+    RotationGesture { position: LogicalPoint, delta: f32, phase: TouchPhase },
+    /// A platform-recognized double-tap gesture ("smart magnify" on macOS trackpad).
+    DoubleTapGesture { position: LogicalPoint },
     /// The mouse exited the item or component
     Exit,
 }
@@ -64,6 +74,9 @@ impl MouseEvent {
             MouseEvent::Released { is_touch, .. } => Some(*is_touch),
             MouseEvent::Moved { is_touch, .. } => Some(*is_touch),
             MouseEvent::Wheel { .. } => None,
+            MouseEvent::PinchGesture { .. } => None,
+            MouseEvent::RotationGesture { .. } => None,
+            MouseEvent::DoubleTapGesture { .. } => None,
             MouseEvent::DragMove(..) | MouseEvent::Drop(..) => None,
             MouseEvent::Exit => None,
         }
@@ -76,6 +89,9 @@ impl MouseEvent {
             MouseEvent::Released { position, .. } => Some(*position),
             MouseEvent::Moved { position, .. } => Some(*position),
             MouseEvent::Wheel { position, .. } => Some(*position),
+            MouseEvent::PinchGesture { position, .. } => Some(*position),
+            MouseEvent::RotationGesture { position, .. } => Some(*position),
+            MouseEvent::DoubleTapGesture { position } => Some(*position),
             MouseEvent::DragMove(e) | MouseEvent::Drop(e) => {
                 Some(crate::lengths::logical_point_from_api(e.position))
             }
@@ -90,6 +106,9 @@ impl MouseEvent {
             MouseEvent::Released { position, .. } => Some(position),
             MouseEvent::Moved { position, .. } => Some(position),
             MouseEvent::Wheel { position, .. } => Some(position),
+            MouseEvent::PinchGesture { position, .. } => Some(position),
+            MouseEvent::RotationGesture { position, .. } => Some(position),
+            MouseEvent::DoubleTapGesture { position } => Some(position),
             MouseEvent::DragMove(e) | MouseEvent::Drop(e) => {
                 e.position = crate::api::LogicalPosition::from_euclid(
                     crate::lengths::logical_point_from_api(e.position) + vec,
@@ -110,6 +129,9 @@ impl MouseEvent {
             MouseEvent::Released { position, .. } => Some(position),
             MouseEvent::Moved { position, .. } => Some(position),
             MouseEvent::Wheel { position, .. } => Some(position),
+            MouseEvent::PinchGesture { position, .. } => Some(position),
+            MouseEvent::RotationGesture { position, .. } => Some(position),
+            MouseEvent::DoubleTapGesture { position } => Some(position),
             MouseEvent::DragMove(e) | MouseEvent::Drop(e) => {
                 e.position = crate::api::LogicalPosition::from_euclid(
                     transform
@@ -134,6 +156,20 @@ impl MouseEvent {
             _ => (),
         }
     }
+}
+
+/// Phase of a touch or gesture event.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TouchPhase {
+    /// The gesture began (e.g., first finger touched or platform gesture started).
+    Started,
+    /// The gesture is ongoing (e.g., fingers moved or platform gesture updated).
+    Moved,
+    /// The gesture completed normally.
+    Ended,
+    /// The gesture was cancelled (e.g., interrupted by the system).
+    Cancelled,
 }
 
 /// This value is returned by the `input_event` function of an Item
@@ -344,6 +380,8 @@ pub fn make_keyboard_shortcut(
 #[cfg(feature = "ffi")]
 #[allow(unsafe_code)]
 pub(crate) mod ffi {
+    use crate::api::ToSharedString as _;
+
     use super::*;
 
     #[unsafe(no_mangle)]
@@ -366,11 +404,19 @@ pub(crate) mod ffi {
     }
 
     #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn slint_keyboard_shortcut_debug_string(
+        shortcut: &KeyboardShortcut,
+        out: &mut SharedString,
+    ) {
+        *out = crate::format!("{shortcut:?}");
+    }
+
+    #[unsafe(no_mangle)]
     pub unsafe extern "C" fn slint_keyboard_shortcut_to_string(
         shortcut: &KeyboardShortcut,
         out: &mut SharedString,
     ) {
-        *out = crate::format!("{shortcut}")
+        *out = shortcut.to_shared_string();
     }
 
     #[unsafe(no_mangle)]
@@ -407,9 +453,111 @@ impl KeyboardShortcut {
 
         event_text.eq(self.key.chars()) && key_event.modifiers == expected_modifiers
     }
+
+    fn format_key_for_display(&self) -> crate::SharedString {
+        let key_str = self.key.as_str();
+        let first_char = key_str.chars().next();
+
+        if let Some(first_char) = first_char {
+            macro_rules! check_special_key {
+                ($($char:literal # $name:ident # $($shifted:expr)? $(=> $($qt:ident)|* # $($winit:ident $(($_pos:ident))?)|* # $($xkb:ident)|*)? ;)*) => {
+                    match first_char {
+                    $($(
+                        // Use $qt as a marker - if it exists, generate the check
+                        $char => {
+                            let _ = stringify!($($qt)|*); // Use $qt to enable this branch
+                            return stringify!($name).into();
+                        }
+                    )?)*
+                        _ => ()
+                    }
+                };
+            }
+            i_slint_common::for_each_keys!(check_special_key);
+        }
+
+        if key_str.chars().count() == 1 {
+            return key_str.to_uppercase().into();
+        }
+
+        key_str.into()
+    }
 }
 
 impl Display for KeyboardShortcut {
+    /// Converts the keyboard shortcut to a string that looks native on the current platform.
+    ///
+    /// For example, the shortcut created with @keys(Meta + Control + A)
+    /// will be converted like this:
+    /// - **macOS**: `⌃⌘A`
+    /// - **Windows**: `Super+Ctrl+A`
+    /// - **Linux**: `Super+Ctrl+A`
+    ///
+    /// Note that this functions output is best-effort and may be adjusted/improved at any time,
+    /// do not rely on this output to be stable!
+    //
+    // References for implementation
+    // - macOS: <https://developer.apple.com/design/human-interface-guidelines/keyboards>
+    // - Windows: <https://learn.microsoft.com/en-us/windows/apps/design/input/keyboard-accelerators>
+    // - Linux: <https://developer.gnome.org/hig/guidelines/keyboard.html>
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.key.is_empty() {
+            return Ok(());
+        }
+
+        if cfg!(target_os = "macos") {
+            // Slint remaps modifiers on macOS: control → Command, meta → Control
+            // From Apple's documentation:
+            //
+            // List modifier keys in the correct order.
+            // If you use more than one modifier key in a custom shortcut, always list them in this order:
+            //  Control, Option, Shift, Command
+            if self.modifiers.meta {
+                f.write_str("⌃")?;
+            }
+            if !self.ignore_alt && self.modifiers.alt {
+                f.write_str("⌥")?;
+            }
+            if !self.ignore_shift && self.modifiers.shift {
+                f.write_str("⇧")?;
+            }
+            if self.modifiers.control {
+                f.write_str("⌘")?;
+            }
+        } else {
+            let separator = "+";
+
+            // TODO: These should probably be translated, but better to have at least
+            // platform-local names than nothing.
+            let (ctrl_str, alt_str, shift_str, meta_str) = if cfg!(target_os = "windows") {
+                ("Ctrl", "Alt", "Shift", "Win")
+            } else {
+                ("Ctrl", "Alt", "Shift", "Super")
+            };
+
+            if self.modifiers.meta {
+                f.write_str(meta_str)?;
+                f.write_str(separator)?;
+            }
+            if self.modifiers.control {
+                f.write_str(ctrl_str)?;
+                f.write_str(separator)?;
+            }
+            if !self.ignore_alt && self.modifiers.alt {
+                f.write_str(alt_str)?;
+                f.write_str(separator)?;
+            }
+            if !self.ignore_shift && self.modifiers.shift {
+                f.write_str(shift_str)?;
+                f.write_str(separator)?;
+            }
+        }
+        f.write_str(&self.format_key_for_display())
+    }
+}
+
+impl core::fmt::Debug for KeyboardShortcut {
+    /// Formats the keyboard shortcut so that the output would be accepted by the @keys macro in Slint.
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         // Make sure to keep this in sync with the implemenation in compiler/langtype.rs
         if self.key.is_empty() {
@@ -1172,5 +1320,132 @@ impl TextCursorBlinker {
     /// text editable elements looses the focus or is hidden.
     pub fn stop(&self) {
         self.cursor_blink_timer.stop()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    extern crate alloc;
+
+    #[test]
+    fn test_to_string() {
+        let test_cases = [
+            (
+                "a",
+                KeyboardModifiers { alt: false, control: true, shift: false, meta: false },
+                false,
+                false,
+                "⌘A",
+                "Ctrl+A",
+                "Ctrl+A",
+            ),
+            (
+                "a",
+                KeyboardModifiers { alt: true, control: true, shift: true, meta: true },
+                false,
+                false,
+                "⌃⌥⇧⌘A",
+                "Win+Ctrl+Alt+Shift+A",
+                "Super+Ctrl+Alt+Shift+A",
+            ),
+            (
+                "\u{001b}",
+                KeyboardModifiers { alt: false, control: true, shift: true, meta: false },
+                false,
+                false,
+                "⇧⌘Escape",
+                "Ctrl+Shift+Escape",
+                "Ctrl+Shift+Escape",
+            ),
+            (
+                "+",
+                KeyboardModifiers { alt: false, control: true, shift: false, meta: false },
+                true,
+                false,
+                "⌘+",
+                "Ctrl++",
+                "Ctrl++",
+            ),
+            (
+                "a",
+                KeyboardModifiers { alt: true, control: true, shift: false, meta: false },
+                false,
+                true,
+                "⌘A",
+                "Ctrl+A",
+                "Ctrl+A",
+            ),
+            (
+                "",
+                KeyboardModifiers { alt: false, control: true, shift: false, meta: false },
+                false,
+                false,
+                "",
+                "",
+                "",
+            ),
+            (
+                "\u{000a}",
+                KeyboardModifiers { alt: false, control: false, shift: false, meta: false },
+                false,
+                false,
+                "Return",
+                "Return",
+                "Return",
+            ),
+            (
+                "\u{0009}",
+                KeyboardModifiers { alt: false, control: false, shift: false, meta: false },
+                false,
+                false,
+                "Tab",
+                "Tab",
+                "Tab",
+            ),
+            (
+                "\u{0020}",
+                KeyboardModifiers { alt: false, control: false, shift: false, meta: false },
+                false,
+                false,
+                "Space",
+                "Space",
+                "Space",
+            ),
+            (
+                "\u{0008}",
+                KeyboardModifiers { alt: false, control: false, shift: false, meta: false },
+                false,
+                false,
+                "Backspace",
+                "Backspace",
+                "Backspace",
+            ),
+        ];
+
+        for (
+            key,
+            modifiers,
+            ignore_shift,
+            ignore_alt,
+            _expected_macos,
+            _expected_windows,
+            _expected_linux,
+        ) in test_cases
+        {
+            let shortcut = make_keyboard_shortcut(key.into(), modifiers, ignore_shift, ignore_alt);
+
+            use crate::alloc::string::ToString;
+            let result = shortcut.to_string();
+
+            #[cfg(target_os = "macos")]
+            assert_eq!(result.as_str(), _expected_macos, "Failed for key: {:?}", key);
+
+            #[cfg(target_os = "windows")]
+            assert_eq!(result.as_str(), _expected_windows, "Failed for key: {:?}", key);
+
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+            assert_eq!(result.as_str(), _expected_linux, "Failed for key: {:?}", key);
+        }
     }
 }

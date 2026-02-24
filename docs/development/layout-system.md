@@ -1,5 +1,6 @@
 # Layout System Internals
 
+> Note for AI coding assistants (agents):
 > **When to load this document:** Working on `internal/core/layout.rs`,
 > `internal/compiler/passes/lower_layout.rs`, debugging sizing/positioning issues,
 > or implementing new layout features.
@@ -25,7 +26,7 @@ Layout types:
 | `internal/compiler/layout.rs` | Compiler-side layout data structures |
 | `internal/compiler/passes/lower_layout.rs` | Lowers layout elements to expressions |
 | `internal/compiler/passes/default_geometry.rs` | Sets default width/height (runs after layout lowering) |
-| `internal/compiler/llr/lower_expression.rs` | Converts layout expressions to LLR (`compute_*_layout_info` and `solve_*_layout` functions) |
+| `internal/compiler/llr/lower_layout_expression.rs` | Converts layout expressions to LLR |
 
 ## Constraint System
 
@@ -226,7 +227,7 @@ Repeaters (dynamic item lists) in layouts use indirection:
 cargo test -p test-driver-rust --test layout
 cargo test -p test-driver-interpreter layout
 
-# Run a specific test case (filtered by substring)
+# Run a specific test case, filtered by substring (don't prepend sh/bash, run_tests.sh is executable)
 tests/run_tests.sh rust grid_conditional_row
 tests/run_tests.sh interpreter grid_conditional_row
 tests/run_tests.sh cpp grid_conditional_row

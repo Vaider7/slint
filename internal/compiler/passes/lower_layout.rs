@@ -709,12 +709,31 @@ fn lower_box_layout(
 }
 
 fn lower_flexbox_layout(layout_element: &ElementRc, diag: &mut BuildDiagnostics) {
+    // Warn if alignment is set to stretch, which behaves like start in flexbox
+    // (CSS spec: justify-content:stretch acts as flex-start for flex items)
+    if let Some(binding) = layout_element.borrow().bindings.get("alignment") {
+        let binding = binding.borrow();
+        if matches!(binding.expression.ignore_debug_hooks(),
+            Expression::EnumerationValue(v) if v.enumeration.name == "LayoutAlignment"
+                && v.enumeration.values[v.value] == "stretch")
+        {
+            diag.push_warning(
+                "alignment: stretch has no effect on FlexBoxLayout".into(),
+                &*binding,
+            );
+        }
+    }
+
     let direction = crate::layout::binding_reference(layout_element, "flex-direction");
+    let align_content = crate::layout::binding_reference(layout_element, "align-content");
+    let align_items = crate::layout::binding_reference(layout_element, "align-items");
 
     let mut layout = crate::layout::FlexBoxLayout {
         elems: Default::default(),
         geometry: LayoutGeometry::new(layout_element),
         direction,
+        align_content,
+        align_items,
     };
 
     // FlexBoxLayout needs 4 values per item: x, y, width, height

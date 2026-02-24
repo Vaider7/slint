@@ -4,7 +4,7 @@
 // cSpell: ignore frameless qbrush qpointf qreal qwidgetsize svgz
 
 use cpp::*;
-use i_slint_common::sharedfontique::{self, HashedBlob};
+use i_slint_common::sharedfontique::HashedBlob;
 use i_slint_core::graphics::rendering_metrics_collector::{
     RenderingMetrics, RenderingMetricsCollector,
 };
@@ -621,6 +621,7 @@ fn adjust_rect_and_border_for_inner_drawing(rect: &mut qttypes::QRectF, border_w
 struct QtItemRenderer<'a> {
     painter: QPainterPtr,
     cache: &'a ItemCache<qttypes::QPixmap>,
+    text_layout_cache: &'a sharedparley::TextLayoutCache,
     window: &'a i_slint_core::api::Window,
     metrics: RenderingMetrics,
 }
@@ -690,7 +691,7 @@ impl ItemRenderer for QtItemRenderer<'_> {
     ) {
         self.save_state();
         self.pixel_align_origin();
-        sharedparley::draw_text(self, text, Some(self_rc), size);
+        sharedparley::draw_text(self, text, Some(self_rc), size, Some(self.text_layout_cache));
         self.restore_state();
     }
 
@@ -984,6 +985,7 @@ impl ItemRenderer for QtItemRenderer<'_> {
             std::pin::pin!((SharedString::from(string), Brush::from(color))),
             None,
             logical_size_from_api(self.window.size().to_logical(self.scale_factor())),
+            None,
         );
     }
 
@@ -1599,6 +1601,7 @@ pub struct QtWindow {
     rendering_metrics_collector: RefCell<Option<Rc<RenderingMetricsCollector>>>,
 
     cache: ItemCache<qttypes::QPixmap>,
+    text_layout_cache: sharedparley::TextLayoutCache,
 
     tree_structure_changed: RefCell<bool>,
 
@@ -1638,6 +1641,7 @@ impl QtWindow {
                 self_weak: self_weak.clone(),
                 rendering_metrics_collector: Default::default(),
                 cache: Default::default(),
+                text_layout_cache: Default::default(),
                 tree_structure_changed: RefCell::new(false),
                 color_scheme: Default::default(),
                 window_icon_cache_key: Default::default(),
@@ -1662,9 +1666,12 @@ impl QtWindow {
         let window_adapter = runtime_window.window_adapter();
         runtime_window.draw_contents(|components| {
             i_slint_core::animations::update_animations();
+            self.text_layout_cache.clear_cache_if_scale_factor_changed(&self.window);
+
             let mut renderer = QtItemRenderer {
                 painter,
                 cache: &self.cache,
+                text_layout_cache: &self.text_layout_cache,
                 window: &self.window,
                 metrics: RenderingMetrics { layers_created: Some(0), ..Default::default() },
             };
@@ -2168,7 +2175,15 @@ impl i_slint_core::renderer::RendererSealed for QtWindow {
         max_width: Option<LogicalLength>,
         text_wrap: TextWrap,
     ) -> LogicalSize {
-        sharedparley::text_size(self, text_item, item_rc, max_width, text_wrap)
+        sharedparley::text_size(
+            self,
+            text_item,
+            item_rc,
+            max_width,
+            text_wrap,
+            Some(&self.text_layout_cache),
+        )
+        .unwrap_or_default()
     }
 
     fn char_size(
@@ -2177,14 +2192,24 @@ impl i_slint_core::renderer::RendererSealed for QtWindow {
         item_rc: &i_slint_core::item_tree::ItemRc,
         ch: char,
     ) -> LogicalSize {
-        sharedparley::char_size(text_item, item_rc, ch).unwrap_or_default()
+        self.slint_context()
+            .and_then(|ctx| {
+                let mut font_ctx = ctx.font_context().borrow_mut();
+                sharedparley::char_size(&mut font_ctx, text_item, item_rc, ch)
+            })
+            .unwrap_or_default()
     }
 
     fn font_metrics(
         &self,
         font_request: i_slint_core::graphics::FontRequest,
     ) -> i_slint_core::items::FontMetrics {
-        sharedparley::font_metrics(font_request)
+        self.slint_context()
+            .map(|ctx| {
+                let mut font_ctx = ctx.font_context().borrow_mut();
+                sharedparley::font_metrics(&mut font_ctx, font_request)
+            })
+            .unwrap_or_default()
     }
 
     fn text_input_byte_offset_for_position(
@@ -2209,7 +2234,8 @@ impl i_slint_core::renderer::RendererSealed for QtWindow {
         &self,
         data: &'static [u8],
     ) -> Result<(), Box<dyn std::error::Error>> {
-        sharedfontique::get_collection().register_fonts(data.to_vec().into(), None);
+        let ctx = self.slint_context().ok_or("slint platform not initialized")?;
+        ctx.font_context().borrow_mut().collection.register_fonts(data.to_vec().into(), None);
         Ok(())
     }
 
@@ -2219,7 +2245,8 @@ impl i_slint_core::renderer::RendererSealed for QtWindow {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let requested_path = path.canonicalize().unwrap_or_else(|_| path.into());
         let contents = std::fs::read(requested_path)?;
-        sharedfontique::get_collection().register_fonts(contents.into(), None);
+        let ctx = self.slint_context().ok_or("slint platform not initialized")?;
+        ctx.font_context().borrow_mut().collection.register_fonts(contents.into(), None);
         Ok(())
     }
 
@@ -2240,6 +2267,7 @@ impl i_slint_core::renderer::RendererSealed for QtWindow {
     ) -> Result<(), i_slint_core::platform::PlatformError> {
         // Invalidate caches:
         self.cache.component_destroyed(component);
+        self.text_layout_cache.component_destroyed(component);
         Ok(())
     }
 

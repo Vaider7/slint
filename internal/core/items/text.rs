@@ -298,11 +298,13 @@ impl Item for StyledTextItem {
                 let window_inner = WindowInner::from_pub(window_adapter.window());
                 let scale_factor = crate::lengths::ScaleFactor::new(window_inner.scale_factor());
                 if let Some(link) = crate::textlayout::sharedparley::link_under_cursor(
+                    &mut window_inner.context().font_context().borrow_mut(),
                     scale_factor,
                     self,
                     self_rc,
                     LogicalSize::from_lengths(self.width(), self.height()),
                     *position * scale_factor,
+                    None, // No cache available from item event handler
                 ) {
                     Self::FIELD_OFFSETS.link_clicked.apply_pin(self).call(&(link.into(),));
                 }

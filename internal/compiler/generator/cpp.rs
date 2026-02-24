@@ -3549,6 +3549,9 @@ fn compile_expression(expr: &llr::Expression, ctx: &EvaluationContext) -> String
                         cases.join(" ")
                     )
                 }
+                (Type::KeyboardShortcutType, Type::String) => {
+                    format!("slint::private_api::keyboard_shortcut_to_string({f})")
+                }
                 _ => f,
             }
         }
@@ -4438,13 +4441,14 @@ fn compile_builtin_function_call(
                 panic!("internal error: invalid args to RetartTimer {arguments:?}")
             }
         }
-        BuiltinFunction::EscapeMarkdown => {
-            let text = a.next().unwrap();
-            format!("slint::private_api::escape_markdown({})", text)
-        }
         BuiltinFunction::ParseMarkdown => {
-            let text = a.next().unwrap();
-            format!("slint::private_api::parse_markdown({})", text)
+            let format_string = a.next().unwrap();
+            let args = a.next().unwrap();
+            format!("slint::private_api::parse_markdown({}, {})", format_string, args)
+        }
+        BuiltinFunction::StringToStyledText => {
+            let string = a.next().unwrap();
+            format!("slint::private_api::string_to_styled_text({})", string)
         }
     }
 }
