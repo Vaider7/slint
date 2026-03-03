@@ -74,7 +74,7 @@ impl Item for ComplexText {
     ) -> LayoutInfo {
         text_layout_info(
             self,
-            &self_rc,
+            self_rc,
             window_adapter,
             orientation,
             Self::FIELD_OFFSETS.width.apply_pin(self),
@@ -263,7 +263,7 @@ impl Item for StyledTextItem {
     ) -> LayoutInfo {
         text_layout_info(
             self,
-            &self_rc,
+            self_rc,
             window_adapter,
             orientation,
             Self::FIELD_OFFSETS.width.apply_pin(self),
@@ -890,7 +890,7 @@ impl Item for TextInput {
                     self.set_cursor_position(
                         clicked_offset,
                         true,
-                        if (pressed - 1) % 3 == 0 {
+                        if (pressed - 1).is_multiple_of(3) {
                             TextChangeNotify::TriggerCallbacks
                         } else {
                             TextChangeNotify::SkipCallbacks
@@ -1005,11 +1005,13 @@ impl Item for TextInput {
                     None => (),
                 };
 
-                if let Some(keycode) = event.text.chars().next() {
-                    if keycode == key_codes::Return && !self.read_only() && self.single_line() {
-                        Self::FIELD_OFFSETS.accepted.apply_pin(self).call(&());
-                        return KeyEventResult::EventAccepted;
-                    }
+                if let Some(keycode) = event.text.chars().next()
+                    && keycode == key_codes::Return
+                    && !self.read_only()
+                    && self.single_line()
+                {
+                    Self::FIELD_OFFSETS.accepted.apply_pin(self).call(&());
+                    return KeyEventResult::EventAccepted;
                 }
 
                 // Only insert/interpreter non-control character strings
@@ -2054,12 +2056,12 @@ impl TextInput {
                 true,
                 FocusReason::PointerClick,
             );
-        } else if !self.read_only() {
-            if let Some(w) = window_adapter.internal(crate::InternalToken) {
-                w.input_method_request(InputMethodRequest::Enable(
-                    self.ime_properties(window_adapter, self_rc),
-                ));
-            }
+        } else if !self.read_only()
+            && let Some(w) = window_adapter.internal(crate::InternalToken)
+        {
+            w.input_method_request(InputMethodRequest::Enable(
+                self.ime_properties(window_adapter, self_rc),
+            ));
         }
     }
 

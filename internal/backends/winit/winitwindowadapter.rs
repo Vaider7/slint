@@ -119,9 +119,7 @@ fn icon_to_winit(
 ) -> Option<winit::window::Icon> {
     let image_inner: &ImageInner = (&icon).into();
 
-    let Some(pixel_buffer) = image_inner.render_to_buffer(Some(size.cast())) else {
-        return None;
-    };
+    let pixel_buffer = image_inner.render_to_buffer(Some(size.cast()))?;
 
     // This could become a method in SharedPixelBuffer...
     let rgba_pixels: Vec<u8> = match &pixel_buffer {
@@ -162,6 +160,7 @@ fn window_is_resizable(
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 enum WinitWindowOrNone {
     HasWindow {
         window: Arc<winit::window::Window>,
@@ -1006,13 +1005,13 @@ impl WinitWindowAdapter {
 
             // Make sure the dark color scheme property is up-to-date, as it may have been queried earlier when
             // the window wasn't mapped yet.
-            if let Some(color_scheme_prop) = self.color_scheme.get() {
-                if let Some(theme) = winit_window.theme() {
-                    color_scheme_prop.as_ref().set(match theme {
-                        winit::window::Theme::Dark => ColorScheme::Dark,
-                        winit::window::Theme::Light => ColorScheme::Light,
-                    })
-                }
+            if let Some(color_scheme_prop) = self.color_scheme.get()
+                && let Some(theme) = winit_window.theme()
+            {
+                color_scheme_prop.as_ref().set(match theme {
+                    winit::window::Theme::Dark => ColorScheme::Dark,
+                    winit::window::Theme::Light => ColorScheme::Light,
+                })
             }
 
             // In wasm a request_redraw() issued before show() results in a draw() even when the window
@@ -1061,10 +1060,9 @@ impl WinitWindowAdapter {
     ) -> Result<Arc<winit::window::Window>, PlatformError> {
         std::future::poll_fn(move |context| {
             let Some(self_) = self_weak.upgrade() else {
-                return std::task::Poll::Ready(Err(format!(
-                    "Unable to obtain winit window from destroyed window"
-                )
-                .into()));
+                return std::task::Poll::Ready(Err(
+                    "Unable to obtain winit window from destroyed window".to_string().into(),
+                ));
             };
             match self_.winit_window() {
                 Some(window) => std::task::Poll::Ready(Ok(window)),
